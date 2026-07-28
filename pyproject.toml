@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zspan"
+version = "0.1.0"
+description = "Compare segmentation runs by how far their masks span in z, streaming TIFFs as virtual zarr"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "zarr>=3.0",
+    "virtualizarr>=2.0",
+    "virtual-tiff>=0.5",
+    "obstore>=0.11",
+    "obspec-utils>=0.9",
+]
+
+[project.optional-dependencies]
+# to_dask()/to_xarray() and the napari hand-off
+xarray = ["xarray>=2024.1", "dask[array]>=2024.1"]
+# tifffile writes the fixture TIFFs and is the reference oracle in the tests;
+# ipykernel is what runs the notebook
+dev = ["pytest>=7", "tifffile>=2023.1", "ipykernel"]
+
+[tool.setuptools]
+packages = ["zspan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:zspan.*"]
