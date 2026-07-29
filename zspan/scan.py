@@ -2,7 +2,7 @@
 
 The layout this targets looks like::
 
-    data/<segmentation_type>/<model>/<preprocessing>/<model>/<region>/<fov>/masks.tif
+    data/<segmentation_type>/<segmentation_model>/<preprocessing>/<model>/<region>/<fov>/masks.tif
 
 but nothing here is tied to that depth -- the directory components between the
 root and the file become columns, so any nesting works.
