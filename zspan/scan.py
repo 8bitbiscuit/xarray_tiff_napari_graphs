@@ -2,7 +2,7 @@
 
 The layout this targets looks like::
 
-    data/<segmentation_type>/<segmentation_model>/<preprocessing>/<model>/<region>/<fov>/masks.tif
+    data/<segmentation_type>/<model>/<preprocessing>/<model>/<region>/<fov>/masks.tif
 
 but nothing here is tied to that depth -- the directory components between the
 root and the file become columns, so any nesting works.
@@ -18,7 +18,14 @@ from typing import Callable, Iterable, Sequence
 
 import pandas as pd
 
-from .loading import DEFAULT_READ_BYTES, IFDLayout, local_registry, open_mask_volume
+from .loading import (
+    DEFAULT_READ_BYTES,
+    IFDLayout,
+    Reader,
+    local_registry,
+    open_mask_volume,
+    resolve_reader,
+)
 from .metrics import check_z_span, summarise_z_spans
 
 __all__ = ["ScanResult", "find_mask_files", "scan_segmentations", "add_variant_column"]
@@ -97,11 +104,14 @@ def _score_one(
     background: int | None,
     block_shape: tuple[int, int] | None,
     target_bytes: int,
+    reader: Reader,
     ifd_layout: IFDLayout,
     sample: int,
     keep_labels: bool,
 ) -> tuple[dict, pd.DataFrame | None]:
-    volume = open_mask_volume(path, registry, ifd_layout=ifd_layout, sample=sample)
+    volume = open_mask_volume(
+        path, registry, reader=reader, ifd_layout=ifd_layout, sample=sample
+    )
     z_table = check_z_span(
         volume,
         layer_span_cutoff,
@@ -129,6 +139,7 @@ def scan_segmentations(
     background: int | None = 0,
     block_shape: tuple[int, int] | None = None,
     target_bytes: int = DEFAULT_READ_BYTES,
+    reader: Reader = "auto",
     ifd_layout: IFDLayout = "nested",
     sample: int = 0,
     keep_labels: bool = True,
@@ -158,6 +169,11 @@ def scan_segmentations(
     target_bytes
         Byte budget for a single read.  Peak memory is roughly this times
         ``max_workers``.
+    reader
+        Backend for every volume in the scan -- ``"virtual"``, ``"tifffile"``,
+        or ``"auto"`` (default), which resolves once for the root rather than
+        per file, since a scan walks a single tree.  Results are identical
+        either way; see :func:`~zspan.loading.resolve_reader`.
     max_workers
         Threads used to read volumes.  Expect only a modest speedup: zarr funnels
         every chunk request through one background event loop, so workers
@@ -182,7 +198,10 @@ def scan_segmentations(
     # error, and must not be mistaken for one unreadable file mid-scan.
     _level_columns(files[0].relative_to(root), level_names)
 
-    registry, _ = local_registry(root)
+    # Resolve once for the tree: every file under one root routes the same way,
+    # and the registry is virtual-only, so it is not built when nothing uses it.
+    backend = resolve_reader(reader, root)
+    registry = local_registry(root)[0] if backend == "virtual" else None
     if max_workers is None:
         max_workers = min(8, os.cpu_count() or 1)
 
@@ -191,6 +210,7 @@ def scan_segmentations(
         background=background,
         block_shape=block_shape,
         target_bytes=target_bytes,
+        reader=backend,
         ifd_layout=ifd_layout,
         sample=sample,
         keep_labels=keep_labels,

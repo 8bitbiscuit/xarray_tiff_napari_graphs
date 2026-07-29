@@ -1,20 +1,43 @@
 """Lazy, chunk-aware access to segmentation masks stored as multi-page TIFFs.
 
-The TIFF is never read through ``tifffile.imread``.  Instead ``virtual_tiff``
-parses the file's IFDs into a :class:`~virtualizarr.manifests.ManifestStore` --
-a zarr store whose chunks point straight at the byte ranges of the TIFF tiles.
-Opening that store with zarr gives arrays that only fetch the tiles you index,
-so a volume far larger than RAM can be walked a tile at a time.
+Two backends produce the same lazy ``(z, y, x)`` handle, selected by ``reader``:
 
-``virtual_tiff`` exposes each IFD (each z-plane, here) as its own 2D array, so
-:class:`MaskVolume` stacks them back into a ``(z, y, x)`` view.
+``"virtual"``
+    ``virtual_tiff`` parses the file's IFDs into a
+    :class:`~virtualizarr.manifests.ManifestStore` -- a zarr store whose chunks
+    point straight at the byte ranges of the TIFF tiles.  The manifest is a
+    portable artifact: it can be persisted (Icechunk/Kerchunk) and it can front
+    an object store through ``obstore``, which is what makes ``s3://`` work.
+``"tifffile"``
+    ``tifffile``'s own ``aszarr`` store.  Same sub-plane laziness, same chunk
+    geometry, no manifest -- so no manifest cost either.  Local files only.
+
+``"auto"`` (the default) picks ``"virtual"`` for anything remote or backed by an
+explicit registry, and ``"tifffile"`` otherwise.  The two agree exactly: same
+``chunks``, same blocks, identical statistics -- ``tests/test_zspan.py`` asserts
+it against the same oracle used for the streaming/eager equivalence.  The
+manifest is what you are paying for, so pay for it when it buys something:
+
+============================  ===================  ====================
+7x4000x4000 uint32, striped   virtual              tifffile
+============================  ===================  ====================
+open (manifest construction)  325 ms               1 ms
+read @ 8 MiB blocks           1.35 s               1.07 s
+peak memory                   29 MB                29 MB
+============================  ===================  ====================
+
+``virtual_tiff`` exposes each IFD (each z-plane, here) as its own 2D array;
+``tifffile`` presents the series as one 3D array.  :class:`MaskVolume` works in
+terms of the former, so the latter is adapted by :class:`_TiffPlaneView` and
+everything downstream stays on one code path.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Iterator, Literal
+from urllib.parse import urlsplit
 
 import numpy as np
 import zarr
@@ -25,9 +48,20 @@ from virtual_tiff import VirtualTIFF
 if TYPE_CHECKING:  # pragma: no cover - import cost only paid by type checkers
     import xarray as xr
 
-__all__ = ["DEFAULT_READ_BYTES", "MaskVolume", "local_registry", "open_mask_volume"]
+__all__ = [
+    "DEFAULT_READ_BYTES",
+    "MaskVolume",
+    "Reader",
+    "local_registry",
+    "open_mask_volume",
+    "resolve_reader",
+]
 
 IFDLayout = Literal["flat", "nested"]
+
+#: Which backend fetches the bytes.  ``"auto"`` routes on the path -- see
+#: :func:`resolve_reader`.
+Reader = Literal["auto", "virtual", "tifffile"]
 
 #: Byte budget for one read.  Multiply by the worker count for the real peak.
 #:
@@ -40,6 +74,40 @@ IFDLayout = Literal["flat", "nested"]
 #: The optimum is hardware- and layout-dependent; :func:`zspan.tune_read_size`
 #: measures it on your own data.  See :meth:`MaskVolume.read_block_shape`.
 DEFAULT_READ_BYTES = 8 << 20  # 8 MiB
+
+
+def _is_remote(path: str | Path) -> bool:
+    """True for a URL that is not a local file.
+
+    A bare path has no scheme; ``file://`` is local; ``C:\\...`` parses as scheme
+    ``"c"``, hence the length guard.
+    """
+    scheme = urlsplit(str(path)).scheme
+    return len(scheme) > 1 and scheme != "file"
+
+
+def resolve_reader(
+    reader: Reader,
+    path: str | Path,
+    registry: ObjectStoreRegistry | None = None,
+) -> Literal["virtual", "tifffile"]:
+    """Turn ``"auto"`` into a concrete backend; pass anything else through.
+
+    ``"auto"`` picks ``"virtual"`` when the bytes are not a plain local file --
+    a non-``file`` URL, or an explicit registry, which is how an object store is
+    handed in.  Everything else gets ``"tifffile"``, which is faster locally and
+    gives up nothing there.
+
+    Routing on the path rather than on a global means the same notebook works
+    unchanged when the data moves to ``s3://``.
+    """
+    if reader == "auto":
+        return "virtual" if (registry is not None or _is_remote(path)) else "tifffile"
+    if reader not in ("virtual", "tifffile"):
+        raise ValueError(
+            f"reader must be 'auto', 'virtual' or 'tifffile', got {reader!r}"
+        )
+    return reader
 
 
 def local_registry(root: str | Path) -> tuple[ObjectStoreRegistry, str]:
@@ -80,6 +148,83 @@ def _page_arrays(group: zarr.Group, sample: int) -> tuple[zarr.Array, ...]:
     return tuple(group[key] for key in array_keys)
 
 
+class _TiffPlaneView:
+    """One z-plane of a 3D ``tifffile`` zarr array, shaped like a 2D zarr array.
+
+    ``MaskVolume`` is written against ``virtual_tiff``'s one-array-per-IFD
+    layout.  ``tifffile`` presents the series as a single ``(z, y, x)`` array,
+    so this adapts it -- ``shape``, ``chunks``, ``dtype`` and ``[y, x]``
+    indexing are the whole interface ``MaskVolume`` needs from a page.
+
+    Slicing stays lazy: the underlying store fetches only the tiles the window
+    covers, exactly as the virtual backend does.
+    """
+
+    __slots__ = ("_array", "_z")
+
+    def __init__(self, array: zarr.Array, z: int) -> None:
+        self._array = array
+        self._z = z
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(self._array.shape[1:])  # type: ignore[return-value]
+
+    @property
+    def chunks(self) -> tuple[int, int]:
+        return tuple(self._array.chunks[1:])  # type: ignore[return-value]
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(self._array.dtype)
+
+    def __getitem__(self, key: Any) -> np.ndarray:
+        y, x = key if isinstance(key, tuple) else (key, slice(None))
+        return self._array[self._z, y, x]
+
+
+def _open_virtual(
+    path: Path,
+    url: str,
+    registry: ObjectStoreRegistry | None,
+    ifd_layout: IFDLayout,
+    sample: int,
+) -> tuple[None, tuple[zarr.Array, ...]]:
+    """Parse the IFDs into a manifest store, one array per IFD."""
+    if registry is None:
+        registry, _ = local_registry(path.parent)
+    manifest_store = VirtualTIFF(ifd_layout=ifd_layout)(url, registry)
+    group = zarr.open_group(store=manifest_store, mode="r")
+    return None, _page_arrays(group, sample)
+
+
+def _open_tifffile(path: Path, sample: int) -> tuple[Any, tuple[Any, ...]]:
+    """Open through ``tifffile``'s own zarr store, one view per plane.
+
+    The store is returned alongside the pages because ``to_dask`` wants the 3D
+    array directly rather than a stack of per-plane views.
+    """
+    import tifffile
+
+    store = tifffile.imread(path, aszarr=True)
+    array = zarr.open(store, mode="r")
+
+    if array.ndim == 2:  # single-page TIFF: one plane, already 2D
+        return store, (array,)
+    if array.ndim != 3:
+        raise ValueError(
+            f"{path.name} parses as a {array.ndim}D array {array.shape}; the "
+            "tifffile reader handles single-sample (z, y, x) masks. Use "
+            "reader='virtual', which selects a sample with sample=."
+        )
+    if sample != 0:
+        raise ValueError(
+            f"sample={sample} requires reader='virtual'; {path.name} parses as a "
+            "single-sample volume under the tifffile reader."
+        )
+    return store, tuple(_TiffPlaneView(array, z) for z in range(array.shape[0]))
+
+
 @dataclass(frozen=True)
 class MaskVolume:
     """A ``(z, y, x)`` label volume backed by one zarr array per z-plane.
@@ -92,6 +237,11 @@ class MaskVolume:
     path: Path
     url: str
     pages: tuple[zarr.Array, ...]
+    #: Which backend fetched these pages -- ``"virtual"`` or ``"tifffile"``.
+    backend: str = "virtual"
+    #: The tifffile store, kept so ``to_dask`` can use the 3D array directly.
+    #: ``None`` for the virtual backend, which stacks per-IFD arrays instead.
+    store: Any = field(default=None, repr=False, compare=False)
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -119,7 +269,7 @@ class MaskVolume:
         z, y, x = self.shape
         return (
             f"MaskVolume({self.path.name!r}, shape=({z}, {y}, {x}), "
-            f"chunks={self.chunks}, dtype={self.dtype})"
+            f"chunks={self.chunks}, dtype={self.dtype}, reader={self.backend!r})"
         )
 
     def read_plane(
@@ -177,10 +327,20 @@ class MaskVolume:
                 yield np.asarray(page[y0:y1, x0:x1])
 
     def to_dask(self, z_chunk: int = 1):
-        """Stack the pages into a lazy ``(z, y, x)`` dask array."""
+        """Stack the pages into a lazy ``(z, y, x)`` dask array.
+
+        The one method the two backends cannot share: ``da.from_zarr`` needs a
+        real zarr array, which the virtual backend has one of per IFD, while the
+        tifffile store is already the 3D array.
+        """
         import dask.array as da
 
-        stacked = da.stack([da.from_zarr(page) for page in self.pages])
+        if self.backend == "tifffile":
+            stacked = da.from_zarr(self.store)
+            if stacked.ndim == 2:  # single-page TIFF
+                stacked = stacked[None]
+        else:
+            stacked = da.stack([da.from_zarr(page) for page in self.pages])
         return stacked.rechunk({0: z_chunk}) if z_chunk != 1 else stacked
 
     def to_xarray(self, name: str = "masks", z_chunk: int = 1) -> "xr.DataArray":
@@ -203,6 +363,7 @@ def open_mask_volume(
     path: str | Path,
     registry: ObjectStoreRegistry | None = None,
     *,
+    reader: Reader = "auto",
     ifd_layout: IFDLayout = "nested",
     sample: int = 0,
 ) -> MaskVolume:
@@ -211,23 +372,50 @@ def open_mask_volume(
     Parameters
     ----------
     path
-        Path to the ``.tif``.
+        Path to the ``.tif``, or a URL when ``reader="virtual"``.
     registry
-        Reuse a registry from :func:`local_registry` when opening many files.
-        A single-file local registry is built on demand when omitted.
+        Reuse a registry from :func:`local_registry` when opening many files, or
+        supply an object store for remote data.  Virtual backend only; passing
+        one is itself a signal that ``"auto"`` should route to ``"virtual"``.
+    reader
+        Which backend fetches the bytes -- ``"virtual"``, ``"tifffile"``, or
+        ``"auto"`` (default) to route on the path.  See :func:`resolve_reader`.
+        The two produce identical statistics; they differ in what they cost and
+        in whether they can reach an object store.
     ifd_layout
-        ``virtual_tiff`` layout.  ``"nested"`` groups each IFD's samples under
-        the IFD; ``"flat"`` puts one array per IFD at the root.  Both are
-        handled, and both give one 2D array per z-plane for single-sample masks.
+        ``virtual_tiff`` layout, virtual backend only.  ``"nested"`` groups each
+        IFD's samples under the IFD; ``"flat"`` puts one array per IFD at the
+        root.  Both give one 2D array per z-plane for single-sample masks.
     sample
         Which sample (channel) to take from each IFD, for ``"nested"`` files
-        that carry more than one.
+        that carry more than one.  Virtual backend only.
     """
+    backend = resolve_reader(reader, path, registry)
+
+    if backend == "tifffile":
+        # Silence rather than error would put a "why is this still slow" -- or
+        # worse, a silently local read of remote data -- a long way from here.
+        if registry is not None:
+            raise ValueError(
+                "reader='tifffile' cannot use an ObjectStoreRegistry: it reads "
+                "local files directly. Use reader='virtual' for object stores, "
+                "or drop the registry."
+            )
+        if _is_remote(path):
+            raise ValueError(
+                f"reader='tifffile' cannot read {path!r}; use reader='virtual' "
+                "with a registry for remote data."
+            )
+        if ifd_layout != "nested":
+            raise ValueError(
+                f"ifd_layout={ifd_layout!r} is a virtual_tiff option and has no "
+                "effect under reader='tifffile'; use reader='virtual'."
+            )
+
     path = Path(path).resolve()
     url = path.as_uri()
-    if registry is None:
-        registry, _ = local_registry(path.parent)
-
-    manifest_store = VirtualTIFF(ifd_layout=ifd_layout)(url, registry)
-    group = zarr.open_group(store=manifest_store, mode="r")
-    return MaskVolume(path=path, url=url, pages=_page_arrays(group, sample))
+    if backend == "tifffile":
+        store, pages = _open_tifffile(path, sample)
+    else:
+        store, pages = _open_virtual(path, url, registry, ifd_layout, sample)
+    return MaskVolume(path=path, url=url, pages=pages, backend=backend, store=store)

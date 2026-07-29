@@ -1,8 +1,10 @@
 """Compare segmentation runs by how far their masks span in z.
 
-Masks are read straight out of multi-page TIFFs as virtual zarr arrays
-(``virtualizarr`` + ``virtual_tiff``), so only the tiles under analysis are ever
-in memory.
+Masks are read straight out of multi-page TIFFs as lazy zarr arrays, so only the
+tiles under analysis are ever in memory.  Two backends do that -- ``virtualizarr``
++ ``virtual_tiff``, which can front an object store, and ``tifffile``'s own
+``aszarr`` store, which is faster on local files.  ``reader="auto"`` picks
+between them; see :func:`zspan.resolve_reader`.
 
 Typical use::
 
@@ -19,8 +21,10 @@ Typical use::
 from .loading import (
     DEFAULT_READ_BYTES,
     MaskVolume,
+    Reader,
     local_registry,
     open_mask_volume,
+    resolve_reader,
 )
 from .metrics import Z_SPAN_COLUMNS, check_z_span, summarise_z_spans
 from .plotting import (
@@ -47,6 +51,7 @@ __all__ = [
     "DEFAULT_READ_BYTES",
     "DEFAULT_TARGETS",
     "MaskVolume",
+    "Reader",
     "ScanResult",
     "SEQUENTIAL_BLUE",
     "Z_SPAN_COLUMNS",
@@ -59,6 +64,7 @@ __all__ = [
     "open_mask_volume",
     "plot_span_distribution",
     "plot_variant_summary",
+    "resolve_reader",
     "scan_segmentations",
     "summarise_z_spans",
     "tune_read_size",

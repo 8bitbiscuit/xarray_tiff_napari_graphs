@@ -20,7 +20,7 @@ from typing import Sequence
 
 import pandas as pd
 
-from .loading import DEFAULT_READ_BYTES, MaskVolume, open_mask_volume
+from .loading import DEFAULT_READ_BYTES, MaskVolume, Reader, open_mask_volume
 from .metrics import check_z_span
 
 __all__ = ["DEFAULT_TARGETS", "best_read_size", "tune_read_size"]
@@ -36,6 +36,7 @@ def tune_read_size(
     repeats: int = 5,
     layer_span_cutoff: int = 1,
     background: int | None = 0,
+    reader: Reader = "auto",
 ) -> pd.DataFrame:
     """Time :func:`~zspan.metrics.check_z_span` at each candidate read size.
 
@@ -49,6 +50,10 @@ def tune_read_size(
     repeats
         Timed runs per candidate.  Three is enough to rank; five to trust the
         spread.
+    reader
+        Backend to open ``volume`` with when it is a path.  Tune with the reader
+        you will scan with: the block sizes are the same either way, but the
+        per-read overhead the curve measures is not.
 
     Returns
     -------
@@ -66,7 +71,7 @@ def tune_read_size(
     size actually controls.
     """
     if not isinstance(volume, MaskVolume):
-        volume = open_mask_volume(volume)
+        volume = open_mask_volume(volume, reader=reader)
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
 

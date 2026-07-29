@@ -30,14 +30,36 @@ pytest
 ```
 
 The tests build their own miniature TIFF trees in `tmp_path`, so they need no
-data on disk. For the notebook, point `SEGMENTATION_ROOT` at your own output.
+data on disk. For the notebook, point `TECHNIQUE_ROOTS` at your own output.
 
 ## How it stays in bounds
 
-`virtualizarr` + `virtual_tiff` parse each multi-page TIFF's IFDs into a zarr
-store whose chunks point straight at the TIFF's tile byte-ranges. Nothing is
-copied or converted; opening that store with zarr yields arrays that fetch only
-the tiles you index.
+Each multi-page TIFF is opened as a lazy zarr array whose chunks are the TIFF's
+own tiles. Nothing is copied or converted; indexing fetches only the tiles the
+window covers.
+
+Two backends do that, chosen with `reader=`:
+
+| | `"tifffile"` | `"virtual"` |
+|---|---|---|
+| how | `tifffile`'s `aszarr` store | `virtualizarr` + `virtual_tiff` IFD manifest |
+| open, small tiled file | ~1 ms | 17 ms |
+| open, 7×4000×4000 striped (1750 chunks) | ~1 ms | 325 ms |
+| read, that same 448 MB volume @ 8 MiB blocks | 1.07 s | 1.35 s |
+| peak memory | identical | identical |
+| reads `s3://` via `obstore` | no | **yes** |
+| manifest persists (Icechunk/Kerchunk) | no | **yes** |
+
+`reader="auto"` (the default) routes on the path: a plain local file goes to
+`tifffile`, anything with a non-`file` URL scheme — or any call given an
+`ObjectStoreRegistry` — goes to `virtual`. So the same code moves to object
+storage without an edit, and pays nothing for the manifest until it does.
+
+The two are interchangeable by construction: same `chunks`, so the same block
+sizes and the same tuning; identical statistics, asserted against the same
+`find_objects` oracle under both. `reader="tifffile"` *raises* rather than
+silently ignores a registry, a remote path, or an `ifd_layout` — a switch that
+quietly reads the wrong thing is worse than no switch.
 
 The metric is then computed by streaming. The observation that makes it work:
 
@@ -66,6 +88,19 @@ data/segmentations/cpdino/<preprocessing>/<model>/<region>/<fov>/masks.tif
 `level_names` aligns to the **trailing** directories — naming just
 `("region", "fov")` leaves the levels above as `level_0`, `level_1`.
 
+To compare *segmentation techniques*, scan one root per technique and tag each
+scan, so the technique becomes a column rather than a directory level — which is
+what the notebook does:
+
+```
+data/segmentations_3d_stitched/<model>/<region>/<fov>/masks.tif
+data/segmentations_3d_true/<model>/<region>/<fov>/masks.tif
+                           └── level_names=("model","region","fov")
+```
+
+`relpath` is relative to its own root, so both trees reuse the same values —
+join across them on `technique` + `relpath`, never `relpath` alone.
+
 ## What you get back
 
 `scan_segmentations` returns a `ScanResult`:
@@ -90,7 +125,7 @@ you.
 | `plot_span_distribution` | *where* does the difference live? | share of labels at each z-span, categorical hues in fixed slot order |
 
 `CATEGORICAL`, `SEQUENTIAL_BLUE` and `BLUES` are exported too, so notebook-side
-figures stay consistent with these. The notebook builds two of its three views
+figures stay consistent with these. The notebook builds all three of its views
 inline on top of them — see below.
 
 Colours come from a validated palette — adjacent categorical pairs clear
@@ -98,22 +133,36 @@ colour-vision-deficiency separation thresholds. Three of the categorical hues
 sit below 3:1 on a light surface, which is why the notebook ships the summary
 table next to the charts rather than as an extra.
 
-### Choosing a model
+### Choosing a model, across techniques
 
-`z_span_analysis.ipynb` targets a different question from the package
-defaults: **which model produces fewest throwaway masks?** It scores each run on
-the *thin rate* — the share of masks occupying ≤ 2 z-slices, i.e. exactly what a
-cellpose `min_z = 3` filter discards — and ranks models on it, lower being
-better. Three views:
+`z_span_analysis.ipynb` targets a different question from the package defaults:
+**which model produces fewest throwaway masks, and does that answer survive the
+segmentation technique?** It scans one tree per technique — 2D-per-plane
+`stitch_threshold` output against native `do_3D` output — and scores every run
+on the *thin rate*: the share of masks occupying ≤ 2 z-slices, i.e. exactly what
+a cellpose `min_z = 3` filter discards. Lower is better.
 
-1. **Which model wins** — ranked bars with one dot per FOV, because with a
-   handful of FOVs per model a gap smaller than the within-model spread is not
-   a result.
-2. **Is the win real** — yield against thin rate, one point per FOV. A model can
-   post a low thin rate purely by not detecting faint cells; this separates
-   *cleaner* from *more conservative*.
+Technique owns the hue channel throughout, so a colour never changes meaning
+between figures; model identity travels on row position and marker shape. Three
+views:
+
+1. **Which model wins, under which technique** — ranked rows, one bar per
+   technique inside each model, one dot per FOV, because with a handful of FOVs
+   per model a gap smaller than the within-model spread is not a result. Pairing
+   the bars is what makes a *flip* — a model that wins under one technique and
+   loses under the other — visible at all.
+2. **Is the win real** — yield against thin rate, one point per FOV, with an
+   arrow from each model's centroid under one technique to its centroid under
+   the other. A model *or* a technique can post a low thin rate purely by not
+   detecting faint cells; this separates *cleaner* from *more conservative*.
 3. **Where the difference lives** — 100% stacked composition of mask thickness,
-   one row per model, single hue light→dark because thickness is *ordinal*.
+   one panel per technique on shared axes, rows in the ranking from view 1. Read
+   down for the model comparison, across for the technique effect with the model
+   held fixed. Single hue light→dark because thickness is *ordinal*.
+
+The notebook prints a coverage table (FOVs scored per model per technique)
+before any figure, so a comparison that is ragged rather than paired cannot pass
+unnoticed.
 
 Note the polarity: the package's `pct_multi_layer` treats spanning many slices
 as the defect (over-merging), while the thin rate treats the opposite end as the
@@ -156,8 +205,16 @@ failure you are chasing.
   ```
   `best_read_size` returns the *middle* of the fast plateau rather than the
   argmin — the argmin wanders between 4, 8 and 16 MiB across identical runs,
-  while the plateau midpoint is stable and has margin from both cliffs.
-- **Remote data** needs a different store, not different code:
+  while the plateau midpoint is stable and has margin from both cliffs. Tune
+  with the `reader` you will scan with: the block sizes come out the same, but
+  the per-read overhead the curve measures does not.
+- **Don't raise `target_bytes` past the plateau.** Time is flat from 2 to 32 MiB
+  but peak memory tracks the read size linearly — 21 MB at 2 MiB, 29 at 8, 90 at
+  32, 165 at 64 — so anything above ~8 MiB spends the one thing streaming buys
+  and gets nothing back.
+- **Remote data** needs a different store, not different code. This is what
+  `reader="virtual"` exists for, and `"auto"` selects it as soon as the path is
+  a URL or a registry is supplied:
   ```python
   from obstore.store import S3Store
   from obspec_utils.registry import ObjectStoreRegistry

@@ -20,14 +20,21 @@ from zspan import (  # noqa: E402
     add_variant_column,
     check_z_span,
     find_mask_files,
+    local_registry,
     open_mask_volume,
     plot_span_distribution,
     plot_variant_summary,
+    resolve_reader,
     scan_segmentations,
     summarise_z_spans,
+    tune_read_size,
 )
 
 REFERENCE_COLUMNS = ["label", "z_start", "z_end", "z_span", "spans_multiple_layers"]
+
+#: Both backends must produce identical results, so anything touching the read
+#: path is run under each.  "auto" resolves to one of these, never a third thing.
+READERS = ["virtual", "tifffile"]
 
 
 def reference_check_z_span(mask_volume, layer_span_cutoff: int = 1) -> pd.DataFrame:
@@ -182,10 +189,11 @@ def test_rejects_non_3d_input():
 # --------------------------------------------------------------------------- #
 
 
-def test_lazy_volume_matches_tifffile(tiff_tree):
+@pytest.mark.parametrize("reader", READERS)
+def test_lazy_volume_matches_tifffile(tiff_tree, reader):
     path = tiff_tree / "raw" / "region_A" / "fov_01" / "masks.tif"
     expected = tifffile.imread(path)
-    lazy = open_mask_volume(path)
+    lazy = open_mask_volume(path, reader=reader)
 
     assert lazy.shape == expected.shape
     assert lazy.chunks == (1, 16, 16)  # the TIFF's own tiles
@@ -194,18 +202,20 @@ def test_lazy_volume_matches_tifffile(tiff_tree):
                                   expected[3, 5:40, 9:33])
 
 
-def test_lazy_and_eager_agree(tiff_tree):
+@pytest.mark.parametrize("reader", READERS)
+def test_lazy_and_eager_agree(tiff_tree, reader):
     path = tiff_tree / "raw" / "region_B" / "fov_02" / "masks.tif"
-    lazy = check_z_span(open_mask_volume(path))
+    lazy = check_z_span(open_mask_volume(path, reader=reader))
     eager = reference_check_z_span(tifffile.imread(path).astype(np.int32))
     assert normalise(lazy).equals(normalise(eager))
 
 
+@pytest.mark.parametrize("reader", READERS)
 @pytest.mark.parametrize("block_shape", [None, (16, 16), (32, 64), (64, 64)])
-def test_plane_blocks_tile_the_plane_exactly(tiff_tree, block_shape):
+def test_plane_blocks_tile_the_plane_exactly(tiff_tree, block_shape, reader):
     """Whatever the block size, the blocks must cover the plane once each."""
     path = tiff_tree / "decon" / "region_A" / "fov_01" / "masks.tif"
-    lazy = open_mask_volume(path)
+    lazy = open_mask_volume(path, reader=reader)
     _, ny, nx = lazy.shape
 
     blocks = list(lazy.iter_plane_blocks(0, block_shape))
@@ -242,18 +252,20 @@ def test_read_block_shape_batches_chunks_to_a_byte_budget(tiff_tree):
     assert big_y == ny
 
 
-def test_block_size_never_changes_the_answer(tiff_tree):
+@pytest.mark.parametrize("reader", READERS)
+def test_block_size_never_changes_the_answer(tiff_tree, reader):
     """The whole point of the byte budget: it is a speed knob, not a result knob."""
     path = tiff_tree / "raw" / "region_B" / "fov_01" / "masks.tif"
-    lazy = open_mask_volume(path)
+    lazy = open_mask_volume(path, reader=reader)
     baseline = check_z_span(lazy, block_shape=lazy.chunks[1:])
     for target in (1, 1 << 10, 1 << 20, 1 << 30):
         pd.testing.assert_frame_equal(baseline, check_z_span(lazy, target_bytes=target))
 
 
-def test_xarray_and_dask_round_trip(tiff_tree):
+@pytest.mark.parametrize("reader", READERS)
+def test_xarray_and_dask_round_trip(tiff_tree, reader):
     path = tiff_tree / "raw" / "region_A" / "fov_02" / "masks.tif"
-    lazy = open_mask_volume(path)
+    lazy = open_mask_volume(path, reader=reader)
     array = lazy.to_xarray()
 
     assert array.dims == ("z", "y", "x")
@@ -266,10 +278,114 @@ def test_xarray_and_dask_round_trip(tiff_tree):
 
 def test_flat_layout_gives_the_same_volume(tiff_tree):
     path = tiff_tree / "decon" / "region_B" / "fov_01" / "masks.tif"
-    nested = open_mask_volume(path, ifd_layout="nested")
-    flat = open_mask_volume(path, ifd_layout="flat")
+    nested = open_mask_volume(path, reader="virtual", ifd_layout="nested")
+    flat = open_mask_volume(path, reader="virtual", ifd_layout="flat")
     assert nested.shape == flat.shape
     np.testing.assert_array_equal(nested.read_plane(1), flat.read_plane(1))
+
+
+# --------------------------------------------------------------------------- #
+# reader backends
+#
+# The two backends are interchangeable or they are useless -- a switch that
+# quietly changes the numbers is worse than no switch.  So: same geometry, same
+# blocks, same statistics, checked against the same oracle.
+# --------------------------------------------------------------------------- #
+
+
+def test_backends_agree_on_geometry_and_statistics(tiff_tree):
+    path = tiff_tree / "raw" / "region_A" / "fov_02" / "masks.tif"
+    virtual = open_mask_volume(path, reader="virtual")
+    tiff = open_mask_volume(path, reader="tifffile")
+
+    assert virtual.shape == tiff.shape
+    assert virtual.chunks == tiff.chunks          # so read_block_shape agrees
+    assert virtual.dtype == tiff.dtype
+    assert virtual.read_block_shape() == tiff.read_block_shape()
+    np.testing.assert_array_equal(virtual.read_plane(1), tiff.read_plane(1))
+    np.testing.assert_array_equal(
+        virtual.read_plane(2, slice(3, 40), slice(7, 51)),
+        tiff.read_plane(2, slice(3, 40), slice(7, 51)),
+    )
+    pd.testing.assert_frame_equal(check_z_span(virtual), check_z_span(tiff))
+
+
+@pytest.mark.parametrize("reader", READERS)
+def test_backend_matches_the_reference_implementation(tiff_tree, reader):
+    path = tiff_tree / "decon" / "region_B" / "fov_02" / "masks.tif"
+    streamed = check_z_span(open_mask_volume(path, reader=reader))
+    oracle = reference_check_z_span(tifffile.imread(path).astype(np.int32))
+    assert normalise(streamed).equals(normalise(oracle))
+
+
+def test_backend_is_recorded_on_the_volume(tiff_tree):
+    path = tiff_tree / "raw" / "region_A" / "fov_01" / "masks.tif"
+    assert open_mask_volume(path, reader="tifffile").backend == "tifffile"
+    assert open_mask_volume(path, reader="virtual").backend == "virtual"
+    assert "tifffile" in repr(open_mask_volume(path, reader="tifffile"))
+
+
+def test_auto_routes_local_to_tifffile_and_remote_to_virtual(tmp_path):
+    assert resolve_reader("auto", tmp_path / "masks.tif") == "tifffile"
+    assert resolve_reader("auto", "s3://bucket/segs/masks.tif") == "virtual"
+    assert resolve_reader("auto", "https://host/masks.tif") == "virtual"
+    assert resolve_reader("auto", "file:///data/masks.tif") == "tifffile"
+    # a Windows drive letter is a path, not a scheme
+    assert resolve_reader("auto", r"C:\data\masks.tif") == "tifffile"
+    # an explicit registry is how an object store arrives, so it wins
+    registry, _ = local_registry(tmp_path)
+    assert resolve_reader("auto", tmp_path / "masks.tif", registry) == "virtual"
+    # anything explicit passes straight through
+    assert resolve_reader("virtual", tmp_path / "masks.tif") == "virtual"
+    assert resolve_reader("tifffile", "s3://bucket/masks.tif") == "tifffile"
+
+
+def test_unknown_reader_is_rejected(tiff_tree):
+    with pytest.raises(ValueError, match="reader must be"):
+        open_mask_volume(tiff_tree / "raw" / "region_A" / "fov_01" / "masks.tif",
+                         reader="zarr")
+
+
+def test_tifffile_reader_refuses_what_it_cannot_honour(tiff_tree, tmp_path):
+    """Silently ignoring these would hide a remote read that never happened."""
+    path = tiff_tree / "raw" / "region_A" / "fov_01" / "masks.tif"
+    registry, _ = local_registry(tmp_path)
+
+    with pytest.raises(ValueError, match="ObjectStoreRegistry"):
+        open_mask_volume(path, registry, reader="tifffile")
+    with pytest.raises(ValueError, match="remote data"):
+        open_mask_volume("s3://bucket/segs/masks.tif", reader="tifffile")
+    with pytest.raises(ValueError, match="ifd_layout"):
+        open_mask_volume(path, reader="tifffile", ifd_layout="flat")
+
+
+def test_scan_gives_the_same_answer_under_both_readers(tiff_tree):
+    kwargs = dict(pattern="**/masks.tif", level_names=("variant", "region", "fov"))
+    virtual = scan_segmentations(tiff_tree, reader="virtual", **kwargs)
+    tiff = scan_segmentations(tiff_tree, reader="tifffile", **kwargs)
+    auto = scan_segmentations(tiff_tree, reader="auto", **kwargs)
+
+    columns = ["relpath", "n_labels", "pct_multi_layer", "mean_z_span", "n_with_z_gaps"]
+    pd.testing.assert_frame_equal(virtual.summary[columns], tiff.summary[columns])
+    pd.testing.assert_frame_equal(virtual.summary[columns], auto.summary[columns])
+
+    # `.labels` is concatenated in completion order, which threading makes
+    # arbitrary -- the same reader twice does not match row-for-row either.  The
+    # content is what has to agree.
+    def ordered(frame):
+        return frame.sort_values(["relpath", "label"]).reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(ordered(virtual.labels), ordered(tiff.labels))
+
+
+@pytest.mark.parametrize("reader", READERS)
+def test_tune_read_size_accepts_a_reader(tiff_tree, reader):
+    table = tune_read_size(
+        tiff_tree / "raw" / "region_A" / "fov_01" / "masks.tif",
+        targets=(1 << 10, 1 << 20), repeats=1, reader=reader,
+    )
+    assert len(table) == 2
+    assert (table["min_s"] > 0).all()
 
 
 # --------------------------------------------------------------------------- #
