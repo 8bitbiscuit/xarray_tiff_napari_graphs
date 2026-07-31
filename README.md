@@ -218,12 +218,11 @@ does not.
 
 Two figures off one scan:
 
-1. **The whole image** — average change at each layer step, one line per model
-   per technique (hue is technique, marker is model), with every FOV drawn pale
-   behind its mean. The zero crossing is where the average nucleus is widest;
-   distance from zero at the ends is how fast masks open and close. The bold
-   line is the average of the pale ones, not of their masks pooled, so a
-   high-yield FOV does not outvote a low-yield one.
+1. **The whole image** — one line per model per technique (hue is technique,
+   marker is model), every FOV of a model averaged into it. Direction is
+   discarded by default, because a signed average lets growth in the bottom half
+   of a stack cancel shrinkage in the top half — which is the shape of a
+   nucleus, not a property of the segmentation. Lower is steadier.
 2. **One field, four bands** — three equally spaced horizontal dividers, and the
    same profile within each band, over a `FOCUS` you point at any level of the
    tree. Bands are a *position*, which is ordered, so they take one hue
@@ -236,11 +235,10 @@ across the field and the segmenter faithfully reporting it. That is the
 difference between a model to fix and a slide to remount, which is why it is
 worth being able to see separately from figure 1's average.
 
-`METRIC` switches between signed pixels, `abs_delta` (the same with direction
-discarded), and `pct_change`. The signed mean is what "average change" normally
-means, but growth in the bottom half of a stack cancels shrinkage in the top
-half — a per-band or per-technique difference in *stability* often lives only in
-`abs_delta`. `SECTION_ASSIGN` decides whether a band gets the whole area of the
+`METRIC` defaults to `abs_delta` — pixels, direction discarded — because that is
+what compares two methods on stability. `delta` puts the sign back when you want
+to read the shape of a mask through z instead, and `pct_change` scales by the
+mask's own area. `SECTION_ASSIGN` decides whether a band gets the whole area of the
 masks that mostly sit in it, or only the slice of every mask inside it; the scan
 prints what share of mask-planes cross a divider so you know whether the choice
 matters on your data.
