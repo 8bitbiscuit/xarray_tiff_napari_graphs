@@ -28,7 +28,13 @@ from .loading import (
 )
 from .metrics import check_z_span, summarise_z_spans
 
-__all__ = ["ScanResult", "find_mask_files", "scan_segmentations", "add_variant_column"]
+__all__ = [
+    "ScanResult",
+    "add_variant_column",
+    "find_mask_files",
+    "level_columns",
+    "scan_segmentations",
+]
 
 DEFAULT_PATTERN = "*/*/masks.tif"
 
@@ -44,7 +50,7 @@ def find_mask_files(root: str | Path, pattern: str = DEFAULT_PATTERN) -> list[Pa
     return sorted(root.glob(pattern))
 
 
-def _level_columns(
+def level_columns(
     relative: Path, level_names: Sequence[str] | None
 ) -> dict[str, str]:
     """Map a file's parent directories to named columns.
@@ -52,6 +58,10 @@ def _level_columns(
     ``level_names`` aligns to the *trailing* directories, so passing
     ``("region", "fov")`` works whether the root sits above the variant
     directories or inside them.  Unnamed leading levels get ``level_<i>``.
+
+    :func:`scan_segmentations` applies this to every file it scores; it is
+    public so that a pass computing something else off the same tree tags its
+    rows the same way, rather than re-deriving the layout.
     """
     parts = relative.parts[:-1]
     if level_names is None:
@@ -196,7 +206,7 @@ def scan_segmentations(
 
     # Validate the layout up front: a level-name mismatch is a configuration
     # error, and must not be mistaken for one unreadable file mid-scan.
-    _level_columns(files[0].relative_to(root), level_names)
+    level_columns(files[0].relative_to(root), level_names)
 
     # Resolve once for the tree: every file under one root routes the same way,
     # and the registry is virtual-only, so it is not built when nothing uses it.
@@ -228,7 +238,7 @@ def scan_segmentations(
             failures.append((path, error))
         else:
             row, z_table = result
-            levels = _level_columns(path.relative_to(root), level_names)
+            levels = level_columns(path.relative_to(root), level_names)
             rows.append({**levels, **row})
             if z_table is not None and len(z_table):
                 label_frames.append(z_table.assign(**levels, relpath=row["relpath"]))

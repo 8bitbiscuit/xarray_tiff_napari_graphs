@@ -17,15 +17,20 @@ from scipy import ndimage as ndi
 matplotlib.use("Agg")
 
 from zspan import (  # noqa: E402
+    AREA_COLUMNS,
+    SIZE_CHANGE_COLUMNS,
     add_variant_column,
     check_z_span,
     find_mask_files,
+    label_plane_areas,
     local_registry,
     open_mask_volume,
     plot_span_distribution,
     plot_variant_summary,
     resolve_reader,
     scan_segmentations,
+    section_bounds,
+    size_change_between_layers,
     summarise_z_spans,
     tune_read_size,
 )
@@ -185,6 +190,164 @@ def test_rejects_non_3d_input():
 
 
 # --------------------------------------------------------------------------- #
+# per-plane areas, and the change between layers
+#
+# Same guarantee as the z-span metric: the streaming version is held against an
+# in-memory oracle under every block shape, sectioned and not.  Sections make
+# the block geometry load-bearing in a way z-spans never were -- a block can
+# straddle a band boundary -- so that is what the parametrisation is aimed at.
+# --------------------------------------------------------------------------- #
+
+
+def reference_plane_areas(mask_volume, n_sections: int = 1, background: int | None = 0):
+    """The obvious in-memory implementation, kept as the oracle."""
+    rows = []
+    for z, plane in enumerate(mask_volume):
+        for section, (y0, y1) in enumerate(section_bounds(mask_volume.shape[1], n_sections)):
+            values, counts = np.unique(plane[y0:y1], return_counts=True)
+            for value, count in zip(values, counts):
+                if background is None or value != background:
+                    rows.append(
+                        {"label": int(value), "z": z, "section": section, "area": int(count)}
+                    )
+    return pd.DataFrame(rows, columns=list(AREA_COLUMNS))
+
+
+def normalise_areas(frame: pd.DataFrame) -> pd.DataFrame:
+    return (
+        frame[list(AREA_COLUMNS)]
+        .astype(np.int64)
+        .sort_values(["z", "section", "label"])
+        .reset_index(drop=True)
+    )
+
+
+@pytest.mark.parametrize("n_sections", [1, 2, 4])
+@pytest.mark.parametrize("block_shape", [None, (8, 8), (7, 13), (32, 29), (1, 1)])
+def test_plane_areas_match_reference_for_every_block_shape(volume, block_shape, n_sections):
+    got = label_plane_areas(volume, n_sections=n_sections, block_shape=block_shape)
+    assert normalise_areas(got).equals(
+        normalise_areas(reference_plane_areas(volume, n_sections))
+    )
+
+
+def test_areas_straddling_a_band_boundary_are_counted_in_both(volume):
+    """Summing the bands must reproduce the whole plane exactly, not roughly."""
+    whole = label_plane_areas(volume).set_index(["label", "z"])["area"]
+    banded = (
+        label_plane_areas(volume, n_sections=4)
+        .groupby(["label", "z"])["area"]
+        .sum()
+    )
+    assert banded.sort_index().equals(whole.sort_index())
+
+
+def test_plane_areas_agree_with_the_voxel_counts_of_the_z_span_pass(volume):
+    """Two passes over one volume must not disagree about how big a mask is."""
+    per_label = label_plane_areas(volume).groupby("label")["area"].sum()
+    spans = check_z_span(volume).set_index("label")
+    assert per_label.reindex(spans.index).equals(spans["n_voxels"])
+    # ... nor about which planes it is on
+    planes = label_plane_areas(volume).groupby("label").size()
+    assert planes.reindex(spans.index).equals(spans["n_planes"])
+
+
+def test_section_bounds_split_the_plane_evenly_and_completely():
+    bounds = section_bounds(32, 4)
+    assert bounds == [(0, 8), (8, 16), (16, 24), (24, 32)]
+
+    for ny, n in ((30, 4), (31, 4), (7, 3), (100, 7)):
+        bounds = section_bounds(ny, n)
+        assert len(bounds) == n
+        assert bounds[0][0] == 0 and bounds[-1][1] == ny
+        assert all(a[1] == b[0] for a, b in zip(bounds, bounds[1:]))  # no seams
+        sizes = [b - a for a, b in bounds]
+        assert max(sizes) - min(sizes) <= 1
+
+
+def test_section_bounds_rejects_impossible_splits():
+    with pytest.raises(ValueError, match="at least 1"):
+        section_bounds(32, 0)
+    with pytest.raises(ValueError, match="empty"):
+        section_bounds(3, 4)
+
+
+def test_plane_areas_background_and_empty_volume():
+    data = np.zeros((3, 4, 4), np.int32)
+    data[1, 0, 0] = 1
+    assert 0 not in set(label_plane_areas(data)["label"])
+    assert 0 in set(label_plane_areas(data, background=None)["label"])
+
+    empty = label_plane_areas(np.zeros((3, 4, 4), np.int32))
+    assert empty.empty
+    assert list(empty.columns) == list(AREA_COLUMNS)
+    assert size_change_between_layers(empty).empty
+
+
+def test_size_change_reports_signed_deltas_and_percentages():
+    data = np.zeros((3, 8, 8), np.int32)
+    data[0, 0:2, 0:2] = 1  # 4 px
+    data[1, 0:3, 0:3] = 1  # 9 px  -> +5, +125%
+    data[2, 0:1, 0:1] = 1  # 1 px  -> -8, -88.9%
+
+    changes = size_change_between_layers(label_plane_areas(data))
+    assert list(changes["z_from"]) == [0, 1]
+    assert list(changes["delta"]) == [5, -8]
+    np.testing.assert_allclose(changes["pct_change"], [125.0, -800 / 9])
+    assert list(changes.columns) == ["label", "section", *SIZE_CHANGE_COLUMNS]
+
+
+def test_size_change_ignores_appearing_and_disappearing():
+    """A mask's first plane changes from nothing; the one after its last is absence."""
+    data = np.zeros((5, 8, 8), np.int32)
+    data[1:4, 0:2, 0:2] = 1  # present on three planes -> two steps
+    changes = size_change_between_layers(label_plane_areas(data))
+    assert len(changes) == 2
+    assert changes["delta"].abs().sum() == 0  # constant size, so no change at all
+
+
+def test_size_change_across_a_z_gap_is_opt_in():
+    data = np.zeros((4, 8, 8), np.int32)
+    data[0, 0:2, 0:2] = 1  # 4 px
+    data[2, 0:3, 0:3] = 1  # 9 px, one plane later than adjacent
+    areas = label_plane_areas(data)
+
+    assert size_change_between_layers(areas).empty
+    kept = size_change_between_layers(areas, adjacent_only=False)
+    assert list(kept["z_gap"]) == [2]
+    assert list(kept["delta"]) == [5]
+
+
+def test_size_change_never_differences_across_volumes_or_sections():
+    """Label ids repeat between volumes, so the group has to carry more than the id."""
+    areas = pd.DataFrame(
+        {
+            "relpath": ["a", "a", "a", "a", "b", "b"],
+            "label": [1, 1, 1, 1, 1, 1],
+            "section": [0, 0, 1, 1, 0, 0],
+            "z": [0, 1, 0, 1, 0, 1],
+            "area": [10, 20, 5, 1, 100, 50],
+        }
+    )
+    changes = size_change_between_layers(areas)
+    assert len(changes) == 3  # one step each, not a chain through all six rows
+    assert sorted(changes["delta"]) == [-50, -4, 10]
+
+    # naming the group explicitly must be able to collapse the sections away
+    summed = areas.groupby(["relpath", "label", "z"], as_index=False)["area"].sum()
+    whole = size_change_between_layers(summed)
+    assert sorted(whole["delta"]) == [-50, 6]
+
+
+def test_size_change_rejects_a_group_that_is_not_a_mask():
+    areas = pd.DataFrame({"label": [1], "z": [0], "area": [4]})
+    with pytest.raises(ValueError, match="must include 'label'"):
+        size_change_between_layers(areas, group_cols=["z"])
+    with pytest.raises(KeyError, match="missing"):
+        size_change_between_layers(areas, group_cols=["label", "section"])
+
+
+# --------------------------------------------------------------------------- #
 # lazy loading
 # --------------------------------------------------------------------------- #
 
@@ -208,6 +371,34 @@ def test_lazy_and_eager_agree(tiff_tree, reader):
     lazy = check_z_span(open_mask_volume(path, reader=reader))
     eager = reference_check_z_span(tifffile.imread(path).astype(np.int32))
     assert normalise(lazy).equals(normalise(eager))
+
+
+@pytest.mark.parametrize("reader", READERS)
+def test_lazy_and_eager_agree_on_banded_plane_areas(tiff_tree, reader):
+    """Streaming into bands must match counting them with the volume in hand."""
+    path = tiff_tree / "raw" / "region_B" / "fov_02" / "masks.tif"
+    lazy = label_plane_areas(open_mask_volume(path, reader=reader), n_sections=4)
+    eager = reference_plane_areas(tifffile.imread(path).astype(np.int32), n_sections=4)
+    assert normalise_areas(lazy).equals(normalise_areas(eager))
+
+
+@pytest.mark.parametrize("reader", READERS)
+@pytest.mark.parametrize("block_shape", [None, (16, 16), (48, 64)])
+def test_plane_windows_say_where_each_block_came_from(tiff_tree, block_shape, reader):
+    """The windows are the blocks -- positional statistics depend on it."""
+    path = tiff_tree / "decon" / "region_A" / "fov_01" / "masks.tif"
+    lazy = open_mask_volume(path, reader=reader)
+    plane = tifffile.imread(path)[1]
+
+    windows = list(lazy.iter_plane_windows(1, block_shape))
+    blocks = list(lazy.iter_plane_blocks(1, block_shape))
+    assert len(windows) == len(blocks)
+    for (_, block), plain in zip(windows, blocks):
+        np.testing.assert_array_equal(block, plain)
+
+    for (y0, y1, x0, x1), block in windows:
+        assert block.shape == (y1 - y0, x1 - x0)
+        np.testing.assert_array_equal(block, plane[y0:y1, x0:x1])
 
 
 @pytest.mark.parametrize("reader", READERS)
