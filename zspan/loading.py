@@ -302,6 +302,28 @@ class MaskVolume:
         whole_chunks = max(1, (target_bytes // row_bytes) // chunk_y)
         return (min(ny, whole_chunks * chunk_y), nx)
 
+    def iter_plane_windows(
+        self,
+        z: int,
+        block_shape: tuple[int, int] | None = None,
+        *,
+        target_bytes: int = DEFAULT_READ_BYTES,
+    ) -> Iterator[tuple[tuple[int, int, int, int], np.ndarray]]:
+        """Yield ``((y0, y1, x0, x1), block)`` for a z-plane, chunk-aligned.
+
+        Same reads as :meth:`iter_plane_blocks`, with the window each block came
+        from.  Statistics that are *positional* -- per-quadrant, per-band --
+        need to know where a block sat without holding the plane to find out.
+        """
+        _, ny, nx = self.shape
+        by, bx = block_shape if block_shape is not None else self.read_block_shape(target_bytes)
+        page = self.pages[z]
+        for y0 in range(0, ny, by):
+            y1 = min(y0 + by, ny)
+            for x0 in range(0, nx, bx):
+                x1 = min(x0 + bx, nx)
+                yield (y0, y1, x0, x1), np.asarray(page[y0:y1, x0:x1])
+
     def iter_plane_blocks(
         self,
         z: int,
@@ -317,14 +339,10 @@ class MaskVolume:
         ``block_shape`` to override, or lower ``target_bytes`` to cut peak
         memory at the cost of more round-trips.
         """
-        _, ny, nx = self.shape
-        by, bx = block_shape if block_shape is not None else self.read_block_shape(target_bytes)
-        page = self.pages[z]
-        for y0 in range(0, ny, by):
-            y1 = min(y0 + by, ny)
-            for x0 in range(0, nx, bx):
-                x1 = min(x0 + bx, nx)
-                yield np.asarray(page[y0:y1, x0:x1])
+        for _, block in self.iter_plane_windows(
+            z, block_shape, target_bytes=target_bytes
+        ):
+            yield block
 
     def to_dask(self, z_chunk: int = 1):
         """Stack the pages into a lazy ``(z, y, x)`` dask array.

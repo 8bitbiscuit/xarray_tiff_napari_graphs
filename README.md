@@ -21,6 +21,8 @@ plot_variant_summary(summary, group="variant", value="pct_multi_layer")
 ```
 
 The worked example lives in [`z_span_analysis.ipynb`](z_span_analysis.ipynb).
+[`size_change_analysis.ipynb`](size_change_analysis.ipynb) scans the same trees
+for a different defect — see [below](#how-masks-change-size-between-layers).
 
 ## Install
 
@@ -117,6 +119,40 @@ label actually occupies. They differ only when a label has a hole in z, so
 harder error than plain over-merging, and one `find_objects` alone won't show
 you.
 
+### Per-plane areas
+
+`check_z_span` collapses a label to its extent. `label_plane_areas` stops one
+step earlier and keeps the label's **area on each plane**, which is what a
+change in size between layers is computed from:
+
+```python
+from zspan import label_plane_areas, size_change_between_layers
+
+areas = label_plane_areas(volume, n_sections=4)   # label, z, section, area
+steps = size_change_between_layers(areas)         # ... delta, pct_change per z step
+```
+
+Same accumulation, same guarantee: one chunk-aligned block at a time, per-plane
+results merged across blocks so a label straddling a tile boundary is counted
+once, memory independent of image size. The areas are exact counts, and the
+tests hold them against an in-memory oracle under every block shape.
+
+`n_sections` splits each plane into that many equal horizontal bands
+(`section_bounds` gives the row ranges) and reports an area per band, so one
+scan answers both *what does the whole field do* and *does the top of it behave
+like the bottom*. A mask crossing a divider is counted in every band it covers,
+so summing `area` over `section` reproduces the whole-plane area **exactly** —
+the whole-field reading is not an approximation of the banded one.
+
+`size_change_between_layers` differences those along z within each mask. It
+counts only consecutive observations of the same mask: a first plane has nothing
+to change from, and steps that jump a hole in z are dropped by default
+(`adjacent_only=False` keeps them, flagged by `z_gap > 1`) because a mask that
+vanishes and returns is two objects, not one that resized. `group_cols` defaults
+to every column except `z` and `area`, so a concatenated scan carrying
+`technique`/`relpath`/`section` columns differences within each of them without
+being told to.
+
 ## The plots
 
 | Function | Question | Encoding |
@@ -168,6 +204,46 @@ Note the polarity: the package's `pct_multi_layer` treats spanning many slices
 as the defect (over-merging), while the thin rate treats the opposite end as the
 defect. Both come off the same `n_planes` column; pick whichever matches the
 failure you are chasing.
+
+### How masks change size between layers
+
+`size_change_analysis.ipynb` scans the same two trees and asks a question the
+z-span metrics cannot: **not how far a mask reaches through z, but how steadily
+it gets there.** Consecutive planes are a few hundred nanometres apart, so a
+nucleus's cross-section should grow to a mid-plane and shrink away from it
+smoothly. A mask whose area jumps between adjacent layers is usually the
+segmenter changing its mind, not a cell behaving oddly — and per-plane stitching
+has a per-plane decision to be inconsistent about, where a native `do_3D` run
+does not.
+
+Two figures off one scan:
+
+1. **The whole image** — average change at each layer step, one line per model
+   per technique (hue is technique, marker is model), with every FOV drawn pale
+   behind its mean. The zero crossing is where the average nucleus is widest;
+   distance from zero at the ends is how fast masks open and close. The bold
+   line is the average of the pale ones, not of their masks pooled, so a
+   high-yield FOV does not outvote a low-yield one.
+2. **One field, four bands** — three equally spaced horizontal dividers, and the
+   same profile within each band, over a `FOCUS` you point at any level of the
+   tree. Bands are a *position*, which is ordered, so they take one hue
+   light-to-dark. A preview of one mid-stack plane sits beside them, read band
+   by band so it never holds more than a band at once.
+
+Band separation that survives is usually not a segmentation result: it is tilt,
+an illumination or focus gradient, an uneven coverslip — the imaging varying
+across the field and the segmenter faithfully reporting it. That is the
+difference between a model to fix and a slide to remount, which is why it is
+worth being able to see separately from figure 1's average.
+
+`METRIC` switches between signed pixels, `abs_delta` (the same with direction
+discarded), and `pct_change`. The signed mean is what "average change" normally
+means, but growth in the bottom half of a stack cancels shrinkage in the top
+half — a per-band or per-technique difference in *stability* often lives only in
+`abs_delta`. `SECTION_ASSIGN` decides whether a band gets the whole area of the
+masks that mostly sit in it, or only the slice of every mask inside it; the scan
+prints what share of mask-planes cross a divider so you know whether the choice
+matters on your data.
 
 ## Scaling further
 
