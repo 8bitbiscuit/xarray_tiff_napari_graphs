@@ -20,9 +20,12 @@ summary = add_variant_column(result.summary, ["preprocessing", "model"])
 plot_variant_summary(summary, group="variant", value="pct_multi_layer")
 ```
 
-The worked example lives in [`z_span_analysis.ipynb`](z_span_analysis.ipynb).
-[`size_change_analysis.ipynb`](size_change_analysis.ipynb) scans the same trees
-for a different defect — see [below](#how-masks-change-size-between-layers).
+The worked example lives in
+[`z_span_analysis_v4.ipynb`](z_span_analysis_v4.ipynb).
+[`segmentation_method_comparison.ipynb`](segmentation_method_comparison.ipynb)
+comes at the same question from the other end — one field at a time, volumes
+loaded, images alongside — see
+[below](#comparing-the-two-techniques-on-one-field).
 
 ## Install
 
@@ -32,7 +35,10 @@ pytest
 ```
 
 The tests build their own miniature TIFF trees in `tmp_path`, so they need no
-data on disk. For the notebook, point `TECHNIQUE_ROOTS` at your own output.
+data on disk. For the notebooks, point `TECHNIQUE_ROOTS` at your own output —
+`segmentation_method_comparison.ipynb` also wants `DATA_ROOT` and its `METHODS`
+dict, and reads volumes with `tifffile` (the `dev` extra). napari is imported
+only if you ask for a viewer, so a headless kernel runs everything else.
 
 ## How it stays in bounds
 
@@ -92,7 +98,7 @@ data/segmentations/cpdino/<preprocessing>/<model>/<region>/<fov>/masks.tif
 
 To compare *segmentation techniques*, scan one root per technique and tag each
 scan, so the technique becomes a column rather than a directory level — which is
-what the notebook does:
+what `z_span_analysis_v4.ipynb` does:
 
 ```
 data/segmentations_3d_stitched/<model>/<region>/<fov>/masks.tif
@@ -161,17 +167,19 @@ being told to.
 | `plot_span_distribution` | *where* does the difference live? | share of labels at each z-span, categorical hues in fixed slot order |
 
 `CATEGORICAL`, `SEQUENTIAL_BLUE` and `BLUES` are exported too, so notebook-side
-figures stay consistent with these. The notebook builds all three of its views
-inline on top of them — see below.
+figures stay consistent with these. `z_span_analysis_v4.ipynb` builds all three
+of its views inline on top of them — see below — and
+`segmentation_method_comparison.ipynb` copies the same values so its figures
+match without importing the package.
 
 Colours come from a validated palette — adjacent categorical pairs clear
 colour-vision-deficiency separation thresholds. Three of the categorical hues
-sit below 3:1 on a light surface, which is why the notebook ships the summary
+sit below 3:1 on a light surface, which is why both notebooks ship a summary
 table next to the charts rather than as an extra.
 
 ### Choosing a model, across techniques
 
-`z_span_analysis.ipynb` targets a different question from the package defaults:
+`z_span_analysis_v4.ipynb` targets a different question from the package defaults:
 **which model produces fewest throwaway masks, and does that answer survive the
 segmentation technique?** It scans one tree per technique — 2D-per-plane
 `stitch_threshold` output against native `do_3D` output — and scores every run
@@ -205,43 +213,142 @@ as the defect (over-merging), while the thin rate treats the opposite end as the
 defect. Both come off the same `n_planes` column; pick whichever matches the
 failure you are chasing.
 
-### How masks change size between layers
+## Comparing the two techniques on one field
 
-`size_change_analysis.ipynb` scans the same two trees and asks a question the
-z-span metrics cannot: **not how far a mask reaches through z, but how steadily
-it gets there.** Consecutive planes are a few hundred nanometres apart, so a
-nucleus's cross-section should grow to a mid-plane and shrink away from it
-smoothly. A mask whose area jumps between adjacent layers is usually the
-segmenter changing its mind, not a cell behaving oddly — and per-plane stitching
-has a per-plane decision to be inconsistent about, where a native `do_3D` run
-does not.
+[`segmentation_method_comparison.ipynb`](segmentation_method_comparison.ipynb)
+puts the same two techniques — 2D-per-plane `stitch_threshold` against native
+`do_3D` — on the same field, then scores every FOV in a region.
 
-Two figures off one scan:
+It runs on a different footing from the rest of the repo. The scanner above
+streams and never holds a volume; this notebook loads them, through
+[`segmentation_z_helpers.py`](segmentation_z_helpers.py). That is a choice, not
+an oversight: the notebook hands the same arrays straight to napari to look at
+the masks it just flagged, and per-plane areas for a single FOV are cheap once
+the volume is already resident. It takes nothing from the package but the
+palette in `zspan/plotting.py`, so figures from both tracks still sit together.
 
-1. **The whole image** — one line per model per technique (hue is technique,
-   marker is model), every FOV of a model averaged into it. Direction is
-   discarded by default, because a signed average lets growth in the bottom half
-   of a stack cancel shrinkage in the top half — which is the shape of a
-   nucleus, not a property of the segmentation. Lower is steadier.
-2. **One field, four bands** — three equally spaced horizontal dividers, and the
-   same profile within each band, over a `FOCUS` you point at any level of the
-   tree. Bands are a *position*, which is ordered, so they take one hue
-   light-to-dark. A preview of one mid-stack plane sits beside them, read band
-   by band so it never holds more than a band at once.
+`segmentation_z_helpers.py` is `segmentation_z_claude.py` moved into a module —
+same function bodies, same defaults, same printed wording. What changed is
+listed in its docstring: the config globals became keyword arguments (the
+notebook calls each function once per technique, and a global would silently
+apply one technique's settings to the other), `plot_area_change` renders inline
+by default, `import napari` moved inside `launch_viewer`, and `main()` became
+`analyse_masks()` so the comparison loop can re-run the analysis without
+re-narrating it.
 
-Band separation that survives is usually not a segmentation result: it is tilt,
-an illumination or focus gradient, an uneven coverslip — the imaging varying
-across the field and the segmenter faithfully reporting it. That is the
-difference between a model to fix and a slide to remount, which is why it is
-worth being able to see separately from figure 1's average.
+### Two defects, two measurements
 
-`METRIC` defaults to `abs_delta` — pixels, direction discarded — because that is
-what compares two methods on stability. `delta` puts the sign back when you want
-to read the shape of a mask through z instead, and `pct_change` scales by the
-mask's own area. `SECTION_ASSIGN` decides whether a band gets the whole area of the
-masks that mostly sit in it, or only the slice of every mask inside it; the scan
-prints what share of mask-planes cross a divider so you know whether the choice
-matters on your data.
+| | catches | how |
+|---|---|---|
+| **z-span** | masks stitching never joined up (yield a `min_z` filter discards) and masks reaching the whole stack (two nuclei read as one) | `check_z_span` — the inclusive z bounding box of every label |
+| **area change** | the segmenter changing its mind between adjacent planes | `check_area_change` — `abs_frac_change` = \|Δ area\| / area, one row per (object, z-transition) |
+
+Consecutive planes are a few hundred nanometres apart, so a nucleus's
+cross-section should grow to a mid-plane and shrink away from it smoothly. A
+mask whose area jumps between adjacent layers is usually the segmenter being
+inconsistent, not a cell behaving oddly — and per-plane stitching has a
+per-plane decision to be inconsistent about, where a native `do_3D` run does
+not.
+
+Only transitions where a label is present in **both** planes are counted, so a
+mask appearing or disappearing never registers as a 100% change.
+`flag_area_outliers` compares each transition against a reference —
+`CHANGE_REFERENCE="layer"` uses the mean of that z-transition, which controls
+for systematic drift through the stack, and `"global"` the mean over all of them
+— then flags an object whose `OBJECT_STATISTIC` (`max` or `mean`) of that ratio
+clears `AREA_CHANGE_CUTOFF`.
+
+### What it draws
+
+1. **`plot_area_change`**, per technique — the script's two-panel figure, with
+   the left panel log-binned on a log x axis. `log_hist_range` runs the span
+   from the decade holding the smallest *positive* change, floored
+   `HIST_DECADES` below the largest, up to the largest observed: on a log axis
+   the right tail costs almost no width, so there is no reason to truncate it.
+   Log bins cannot hold zero, so both tails fold into the edge bins and are
+   *counted in the annotation* rather than dropped — the exactly-stable
+   transitions are usually a substantial share of real data. The log axis is a
+   display transform and nothing more; the mean and the `cutoff × mean`
+   threshold are still plain arithmetic means, so the flagged objects and the
+   napari layer are exactly the linear version's. Drawing both techniques, pin
+   `hist_xmin`/`hist_xmax` to the pooled range — a log axis that moves under you
+   is not a comparison.
+2. **`compare_span_distribution`** — share of masks at each z-span, grouped
+   bars, normalised within technique so runs with different mask counts compare
+   directly. The bar at 1 is the yield a `min_z` filter throws away; the `6+`
+   bar is masks reaching most of the way through the stack.
+3. **`compare_layer_change`** — mean |Δ area|/area per z-transition with its
+   IQR band, both techniques on one axes, flag threshold dropped because two
+   means and two thresholds is four lines to read where two carry the
+   comparison. A technique sitting higher *everywhere* is less stable overall; a
+   technique that tracks the other but spikes at one transition is usually one
+   bad plane in the acquisition — and if it is, it spikes in both.
+
+Technique owns the hue channel, and marker shape follows it too, so identity
+never rests on colour alone.
+
+### Scoring a whole region
+
+Sections 1–6 walk a single field. Section 7 scans a region:
+
+```python
+found = h.find_region_fovs(TECHNIQUE_ROOTS, "region_UCI-2424")
+region_labels, region_changes = h.scan_region(found, ...)
+metrics = h.fov_metrics(region_labels, region_changes)
+h.plot_fov_table(metrics, title=...)
+```
+
+`find_region_fovs` drops any FOV only one technique produced and prints which —
+a ragged comparison is worse than a missing one — and pins technique order to
+`TECHNIQUE_ROOTS` rather than the alphabet, so rows pair up the same way in
+every region. `scan_region` reads only the mask volume, one at a time: the DAPI
+stack is what `load_data` checks against and neither metric needs it, so peak
+memory is set by the largest FOV rather than by how many there are.
+
+`plot_fov_table` sets the raw per-FOV numbers beside two group scores:
+
+| | |
+|---|---|
+| `Thinness` | `1 − (pct_thin + pct_single_slice) / 100` |
+| `Stability` | `1 − pct_flagged / 100` |
+
+Both start at 1.00 and pay a point per percent of defect. A single-plane mask
+lands in both columns of the thinness score, so it costs twice what a two-plane
+one does — one plane is a failed mask outright, two is only what a `min_z = 3`
+filter happens to discard. The scores are **absolute, not ranked**: 0.82 means
+the same thing in every region, and adding a FOV to the table moves nobody.
+Enough defect drives a score below zero, and only the drawn bar clips at 0 — the
+printed number does not, because a 0.00 and a −0.40 are not the same run.
+
+### The same region, scored on brightness instead
+
+[`brightness_method_comparison.ipynb`](brightness_method_comparison.ipynb) walks
+the same paired FOVs — same `find_region_fovs`, same technique hues — and asks
+what the mask geometry cannot: **do the voxels a technique claims actually look
+like signal?** Every voxel contributes one `(brightness, is_masked)` pair, so a
+technique that over-grows its masks drags background in and its masked
+distribution slides left toward the unmasked one.
+
+One figure per FOV, two panels — voxels in a mask, voxels not in one — with the
+*techniques* overlaid inside each panel, which is the opposite split from the
+single-run figure in
+[`segmentation_z_brightness_claude.py`](segmentation_z_brightness_claude.py).
+Both techniques segment the same DAPI stack, so the bins are built from it once
+and both mask volumes are histogrammed onto them; two distributions binned
+differently cannot be laid over each other. `auc` — P(a random masked voxel is
+brighter than a random unmasked one) — is the one number that survives the two
+groups being wildly different sizes, so it compares techniques and FOVs
+directly. Read it next to `frac_masked`: a technique can post a high AUC by
+masking only the brightest voxels and skipping most of the nuclei.
+
+### Looking at the flagged masks
+
+`build_span_layers` and `build_change_layer` are label-volume filters: each
+returns a copy of the mask volume with everything but the selected labels
+zeroed, so napari toggles them as separate label layers over the DAPI. One
+viewer per technique over the same DAPI, so the same nucleus can be found under
+each. The viewer blocks the kernel until its window closes, which is why that
+cell is off by default.
 
 ## Scaling further
 
