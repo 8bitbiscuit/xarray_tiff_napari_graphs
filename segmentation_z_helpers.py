@@ -915,3 +915,12 @@ def plot_fov_table(metrics: pd.DataFrame, spec=FOV_TABLE_SPEC,
                  fontweight="bold", color=INK)
     fig.subplots_adjust(top=0.80, bottom=0.04, left=0.16, right=0.98)
     return fig
+
+
+def make_3d(viewer=None):
+    if not viewer:
+        viewer = napari.current_viewer()
+
+    for layer in viewer.layers:
+        viewer.layers[str(layer)].scale = (15, 1, 1)
+
