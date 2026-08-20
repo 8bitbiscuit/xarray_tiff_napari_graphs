@@ -59,8 +59,8 @@ from scipy import ndimage as ndi
 
 # CONFIG
 # ----------------------------------------------------------------------------
-MASKS_DIR = Path("data/segmentations_3d_stitched/cpdino/decon/VePo/region_UWA-7648/fov_09")
-DAPI_DIR = Path("data/patches/VePo/region_UWA-7648/fov_09")
+MASKS_DIR = Path("../data/segmentations_3d_stitched/cpdino/decon/VePo/region_UCI-5224/fov_07")
+DAPI_DIR = Path("../data/patches/VePo/region_UCI-5224/fov_07")
 
 MASKS_PATH = MASKS_DIR / "masks.tif"
 DAPI_GLOB = str(DAPI_DIR / "DAPI_decon_z*.tif") # Each z index
