@@ -4,13 +4,18 @@ on one scorecard.
 Three measurements, taken from the repo's scripts and run on the same volumes:
 
 ===========================================  ==========================================
-``segmentation_z_claude.py``                 how far does each mask reach through z
-(via ``segmentation_z_helpers.py``)
+z-span (Part 0-1 below)                      how far does each mask reach through z
 ``segmentation_z_area_sway_claude.py``       does the area-through-z profile wander up
                                              and down, or step in one jump
 ``segmentation_z_brightness_claude.py``      do the voxels a technique claims actually
                                              look like signal
 ===========================================  ==========================================
+
+The z-span half is Part 0 below — the palette, the theme, the region walk, the
+per-plane areas and the span figure — so this module and the two scripts above
+are the whole dependency chain.  The z bounding box is read off the areas array
+by :func:`span_table` rather than by a second ``find_objects`` pass, since the
+areas are what every other measurement here already needs.
 
 Two scripts are deliberately not aggregated.
 
@@ -98,9 +103,9 @@ small integer count, and voxel brightness is bimodal by construction.  So:
 
 3. The scorecard
 ----------------
-Section 7 of ``segmentation_method_comparison.ipynb`` scored two groups of
-columns.  :func:`plot_scorecard` scores four — Span, Jitter, Sway, Signal — and
-adds them up as a **rubric**::
+The card this replaced scored two groups of columns, Thinness and Stability.
+:func:`plot_scorecard` scores four — Span, Jitter, Sway, Signal — and adds them
+up as a **rubric**::
 
     Total = 0.20 * Span + 0.30 * Jitter + 0.20 * Sway + 0.30 * Signal
 
@@ -145,6 +150,7 @@ import glob
 import re
 from pathlib import Path
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -155,20 +161,6 @@ from scipy import stats as sps
 
 import segmentation_z_area_sway_claude as sw
 import segmentation_z_brightness_claude as b
-import segmentation_z_helpers as h
-
-# Re-exported so the notebook needs one import.  The palette, the theme and the
-# region walk are the other notebooks', so every figure in the repo matches.
-apply_theme = h.apply_theme
-available_regions = h.available_regions
-find_region_fovs = h.find_region_fovs
-measure_slice_areas = h.measure_slice_areas
-compare_span_distribution = h.compare_span_distribution
-tag = h.tag
-CATEGORICAL = h.CATEGORICAL
-SEQUENTIAL_BLUE = h.SEQUENTIAL_BLUE
-SURFACE, INK, INK_SECONDARY, GRID = h.SURFACE, h.INK, h.INK_SECONDARY, h.GRID
-MARKERS = h.MARKERS
 
 # CONFIG DEFAULTS
 # ----------------------------------------------------------------------------
@@ -202,6 +194,195 @@ OVERLAP_QUANTILE = 0.5               # the napari bright-unmasked / dim-masked t
 
 
 # =============================================================================
+# Part 0 -- palette, theme, the region walk, and the per-plane areas
+# =============================================================================
+# The figure style and the file walk, so this module carries its own.  A
+# technique keeps its hue across every figure the repo draws, which is what
+# makes a colour mean the same thing in all of them.
+
+# Fixed slot order is the colour-vision-deficiency safety mechanism: assign
+# slots in order, never generate a new hue.
+CATEGORICAL = (
+    "#2a78d6",  # blue
+    "#eb6834",  # orange
+    "#1baf7a",  # aqua
+    "#eda100",  # yellow
+    "#e87ba4",  # magenta
+    "#008300",  # green
+    "#4a3aa7",  # violet
+    "#e34948",  # red
+)
+
+# Single-hue ramp, light -> dark, for magnitude.
+SEQUENTIAL_BLUE = (
+    "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
+    "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b",
+)
+
+SURFACE = "#fcfcfb"
+INK = "#0b0b0b"
+INK_SECONDARY = "#52514e"
+GRID = "#e3e2de"
+
+MARKERS = ("o", "s", "^", "D")  # identity also travels on shape, not colour alone
+
+
+def apply_theme() -> None:
+    """Recessive axes, quiet grid, readable type.  Safe to call repeatedly."""
+    mpl.rcParams.update({
+        "figure.facecolor": SURFACE,
+        "axes.facecolor": SURFACE,
+        "savefig.facecolor": SURFACE,
+        "axes.edgecolor": GRID,
+        "axes.labelcolor": INK_SECONDARY,
+        "axes.titlecolor": INK,
+        "axes.titleweight": "bold",
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": False,
+        "grid.color": GRID,
+        "grid.linewidth": 0.8,
+        "xtick.color": INK_SECONDARY,
+        "ytick.color": INK_SECONDARY,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "text.color": INK,
+        "legend.frameon": False,
+        "legend.fontsize": 9,
+        "font.size": 10,
+        "figure.dpi": 110,
+    })
+
+
+def method_colors(methods) -> dict:
+    """Hue per technique, fixed slot order.
+
+    A technique keeps its colour across every figure in the repo, so a colour
+    never changes meaning between them.
+    """
+    return {name: CATEGORICAL[i] for i, name in enumerate(methods)}
+
+
+def tag(frame: pd.DataFrame, method: str, column: str = "method") -> pd.DataFrame:
+    """Copy of ``frame`` carrying the technique it came from as a column."""
+    out = frame.copy()
+    out[column] = method
+    return out
+
+
+def measure_slice_areas(mask_volume) -> np.ndarray:
+    """Pixel count of every label in every z slice -> array of shape (n_z, n_labels + 1).
+
+    One bincount pass per plane, and the array it returns is what the span table,
+    the single-slice filter and both profile metrics all read — so the volume is
+    scanned once and every measurement below comes off the result.
+    """
+    n_labels = int(mask_volume.max())
+    areas = np.zeros((mask_volume.shape[0], n_labels + 1), dtype=np.int64)
+
+    for z in range(mask_volume.shape[0]):
+        counts = np.bincount(mask_volume[z].ravel(), minlength=n_labels + 1)
+        areas[z] = counts[:n_labels + 1]
+
+    return areas
+
+
+def available_regions(technique_roots, region_glob="region_*") -> list:
+    """Region directories present under *every* technique root, sorted."""
+    per_root = [{d.name for d in Path(root).glob(region_glob) if d.is_dir()}
+                for root in technique_roots.values()]
+    return sorted(set.intersection(*per_root)) if per_root else []
+
+
+def find_region_fovs(technique_roots, region, fov_glob="fov_*",
+                     filename="masks.tif", paired_only=True) -> pd.DataFrame:
+    """Locate ``<technique_root>/<region>/<fov>/masks.tif`` for every FOV found.
+
+    ``technique_roots`` maps a technique name to the directory *above* the
+    region, i.e. ``data/segmentations_3d_true/cpdino/decon/VePo``.  Returns one
+    row per (technique, FOV) with the mask path; with ``paired_only`` a FOV that
+    only one technique produced is dropped rather than compared against nothing.
+    """
+    rows = []
+    for method, root in technique_roots.items():
+        for fov_dir in sorted((Path(root) / region).glob(fov_glob)):
+            path = fov_dir / filename
+            if path.exists():
+                rows.append({"method": method, "fov": fov_dir.name, "path": path})
+
+    found = pd.DataFrame(rows, columns=["method", "fov", "path"])
+    if found.empty:
+        raise FileNotFoundError(
+            f"no {filename} under any {list(technique_roots.values())}/{region}/{fov_glob}")
+
+    if paired_only:
+        per_fov = found.groupby("fov")["method"].nunique()
+        complete = set(per_fov[per_fov == len(technique_roots)].index)
+        dropped = sorted(set(found["fov"]) - complete)
+        if dropped:
+            print(f"skipping {len(dropped)} FOV(s) missing from a technique: "
+                  f"{', '.join(dropped)}")
+        found = found[found["fov"].isin(complete)]
+
+    # technique order follows technique_roots, not the alphabet, so the table
+    # rows pair up the same way in every region
+    found["method"] = pd.Categorical(found["method"], list(technique_roots), ordered=True)
+    return found.sort_values(["fov", "method"]).reset_index(drop=True)
+
+
+def span_distribution(labels: pd.DataFrame, group: str = "method",
+                      max_span: int = 6) -> pd.DataFrame:
+    """Share of masks (%) at each z-span, per technique.  Last bin is inclusive."""
+    binned = labels["z_span"].clip(upper=max_span)
+    counts = (
+        pd.crosstab(labels[group], binned, normalize="index")
+        # first-appearance order, so a technique keeps its hue slot across figures
+        .reindex(index=list(dict.fromkeys(labels[group])))
+        .reindex(columns=range(1, max_span + 1), fill_value=0.0)
+        * 100.0
+    )
+    counts.columns = [str(c) for c in counts.columns[:-1]] + [f"{max_span}+"]
+    return counts
+
+
+def compare_span_distribution(labels: pd.DataFrame, group: str = "method",
+                              max_span: int = 6,
+                              title: str = "How far each mask reaches through z") -> Figure:
+    """Share of masks at each z-span, grouped bars, one hue per technique.
+
+    Normalised within technique so runs with different mask counts compare
+    directly; the tall bar at z_span=1 is the share a ``min_z`` filter throws away.
+    """
+    shares = span_distribution(labels, group=group, max_span=max_span)
+    methods = list(shares.index)
+    colors = method_colors(methods)
+    x = np.arange(shares.shape[1])
+    width = 0.8 / len(methods)
+
+    fig, ax = plt.subplots(figsize=(8.6, 4.4))
+    for i, name in enumerate(methods):
+        offset = (i - (len(methods) - 1) / 2) * width
+        n = int((labels[group] == name).sum())
+        ax.bar(x + offset, shares.loc[name].to_numpy(), width=width * 0.88,
+               color=colors[name], label=f"{name}  (n={n:,})", zorder=2)
+
+    ax.set_xticks(x, list(shares.columns))
+    ax.set_xlabel("z-span of mask (planes, inclusive)")
+    ax.set_ylabel("% of masks in technique")
+    ax.set_title(title, pad=10, loc="left")
+    ax.yaxis.grid(True, zorder=0)
+    ax.set_axisbelow(True)
+    ax.tick_params(length=0)
+    ax.spines["bottom"].set_color(GRID)
+    ax.spines["left"].set_visible(False)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
+
+
+# =============================================================================
 # Part 1 -- z-span, z-gaps, and the single-slice filter
 # =============================================================================
 
@@ -212,10 +393,10 @@ SPAN_COLUMNS = ["label", "z_start", "z_end", "z_span", "n_planes", "has_z_gap",
 def span_table(areas: np.ndarray) -> pd.DataFrame:
     """One row per label, read off the per-plane areas rather than the volume.
 
-    ``z_start``/``z_end``/``z_span`` are what ``h.check_z_span`` returns — the z
-    bounding box — computed here from ``h.measure_slice_areas`` output instead of
-    from ``find_objects``, because the same array is what the single-slice filter
-    and the profile metrics need, and one pass over the volume is enough for all.
+    ``z_start``/``z_end``/``z_span`` are the z bounding box, read off
+    :func:`measure_slice_areas` output rather than from ``find_objects``, because
+    the same array is what the single-slice filter and the profile metrics need,
+    and one pass over the volume is enough for all.
 
     ``n_planes`` is how many planes the label actually occupies.  It differs from
     ``z_span`` only when the label has a hole in z, and ``has_z_gap`` flags that:
@@ -283,7 +464,7 @@ def filter_single_slice(masks: np.ndarray, areas: np.ndarray | None = None,
     either from a label list means another pass over the volume.
     """
     if areas is None:
-        areas = h.measure_slice_areas(masks)
+        areas = measure_slice_areas(masks)
 
     spans = span_table(areas)
     single = spans.loc[spans["z_span"] == 1, "label"].to_numpy()
@@ -401,15 +582,6 @@ def brightness_stats(counts: np.ndarray, edges: np.ndarray) -> pd.Series:
 # Part 3 -- the distribution figure
 # =============================================================================
 
-def method_colors(methods) -> dict:
-    """Hue per technique, fixed slot order — the assignment both other notebooks use.
-
-    A technique keeps its colour across every figure in the repo, so a colour
-    never changes meaning between them.
-    """
-    return {name: CATEGORICAL[i] for i, name in enumerate(methods)}
-
-
 def _log_distribution(ax, values_by_method, lo, top, n_bins=45, marks=("median",)):
     """Log-binned share of a positive, heavy-tailed quantity, one step per technique.
 
@@ -514,11 +686,11 @@ def compare_profile_distribution(labels: pd.DataFrame, column: str = "jitter",
 # =============================================================================
 
 def load_dapi(dapi_glob):
-    """The DAPI half of ``h.load_data``: the stack both techniques segmented.
+    """The DAPI stack both techniques segmented, read once.
 
-    Same glob, same numeric z ordering — ``z10`` sorts after ``z9``, which a plain
-    sort of the filenames gets wrong.  Read once per FOV and reused across
-    techniques, since ``h.load_data`` would re-read it per technique.
+    Numeric z ordering — ``z10`` sorts after ``z9``, which a plain sort of the
+    filenames gets wrong.  Read once per FOV and reused across techniques: the
+    scripts' own loaders re-read the stack for every mask volume.
     """
     files = glob.glob(str(dapi_glob))
 
@@ -555,10 +727,10 @@ def analyse_fov(masks, dapi=None, edges=None, exact=None, drop=DROP_SINGLE_SLICE
     With ``keep_volumes`` the filtered and removed volumes come back too — the
     region walk turns that off so peak memory stays at one FOV.
 
-    ``h.measure_slice_areas`` is called once and its result feeds the span table,
+    :func:`measure_slice_areas` is called once and its result feeds the span table,
     the filter and both profile metrics: one bincount pass answers all of them.
     """
-    areas = h.measure_slice_areas(masks)
+    areas = measure_slice_areas(masks)
     kept, dropped, areas, report = filter_single_slice(masks, areas, drop=drop)
 
     spans = span_table(areas)
@@ -624,7 +796,7 @@ def scan_region(found: pd.DataFrame, dapi_root=None, region: str | None = None,
                 **analysis) -> dict:
     """:func:`analyse_fov` on every row of ``found``; returns tidy frames.
 
-    ``found`` is what ``h.find_region_fovs`` returns — one row per (technique,
+    ``found`` is what :func:`find_region_fovs` returns — one row per (technique,
     FOV) with the mask path, ragged FOVs already dropped.  The DAPI stack is read
     once per FOV and both techniques are histogrammed onto bins built from it:
     two distributions binned differently cannot be laid over each other.
@@ -994,9 +1166,7 @@ def plot_scorecard(metrics: pd.DataFrame, spec=SCORECARD_SPEC,
                    scores: pd.DataFrame | None = None) -> Figure:
     """Individual statistics on the left, the rubric on the right.
 
-    The layout is ``plot_fov_table``'s, from section 7 of
-    ``segmentation_method_comparison.ipynb``: raw columns under their group
-    header, then a bar per score.  Each subscore's header carries the weight it
+    The layout: raw columns under their group header, then a bar per score.  Each subscore's header carries the weight it
     earns toward the ``Total`` (:data:`SCORE_WEIGHTS`), so the rubric is legible
     from the card without reading the source, and ``Total`` is drawn darker and
     bold behind a heavier rule because it is the sum of the columns beside it
@@ -1386,11 +1556,9 @@ def launch_viewer(dapi, masks, layers=None, title=None, z_scale=None):
 def make_3d(viewer=None, z_scale: float = 15.0):
     """Stretch z so the stack has roughly isotropic proportions in the 3D view.
 
-    ``h.make_3d`` does the same thing but calls ``napari.current_viewer()`` with
-    ``napari`` never imported in that module, so it raises ``NameError`` when
-    called without a viewer.  Imported locally here, and the scale is an argument
-    rather than a literal, since the right number is the z step divided by the
-    pixel size.
+    ``napari`` is imported locally so a headless kernel can still import this
+    module, and the scale is an argument rather than a literal, since the right
+    number is the z step divided by the pixel size.
     """
     import napari
 

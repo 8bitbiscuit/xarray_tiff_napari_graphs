@@ -1,15 +1,16 @@
-"""Helpers for ``brightness_method_comparison.ipynb``.
+"""Brightness, two techniques at a time.
 
-The question is the one section 7 of ``segmentation_method_comparison.ipynb``
-asks, against a different measurement: **run every FOV in a region under both
-techniques and compare them**, where the measurement is *how bright the voxels a
-technique claims are, against the ones it leaves behind*.
+``segmentation_comparison_v2.ipynb`` imports this for its two-panel brightness
+figure; the rest of the module is the region walk that figure was built for.
+The question: **run every FOV in a region under both techniques and compare
+them**, where the measurement is *how bright the voxels a technique claims are,
+against the ones it leaves behind*.
 
 Nothing here re-implements the measurement. The histogram machinery --
 ``vectorise_pixels``, ``build_bin_edges``, ``accumulate_histograms``, and the
 statistics that read off the counts -- is imported from
 ``segmentation_z_brightness_claude.py``, and the region walk (``find_region_fovs``)
-and palette come from ``segmentation_z_helpers.py``. This module is only the
+and palette come from ``segmentation_helpers_v2.py``. This module is only the
 part neither of those has: **two mask volumes over the same image, on the same
 bins, in the same panel.**
 
@@ -36,8 +37,8 @@ import pandas as pd
 import tifffile
 from matplotlib.figure import Figure
 
+import segmentation_helpers_v2 as v2
 import segmentation_z_brightness_claude as b
-import segmentation_z_helpers as h
 
 # CONFIG DEFAULTS
 # ----------------------------------------------------------------------------
@@ -48,12 +49,11 @@ CLIP_QUANTILE = 0.999                # x-axis stops here, on the pooled distribu
 
 
 def load_dapi(dapi_glob):
-    """The DAPI half of ``h.load_data``, without a mask volume to check against.
+    """The DAPI stack on its own, without a mask volume to check against.
 
     Both techniques segment the same image, so the stack is read once per FOV
-    and reused; ``load_data`` would re-read it per technique. Same glob, same
-    numeric z ordering -- ``z10`` sorts after ``z9``, which a plain sort of the
-    filenames gets wrong.
+    and reused rather than re-read per technique. Numeric z ordering -- ``z10``
+    sorts after ``z9``, which a plain sort of the filenames gets wrong.
     """
     files = glob.glob(dapi_glob)
 
@@ -75,7 +75,7 @@ def fov_dapi_glob(dapi_root, fov, pattern=DAPI_PATTERN):
 def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True):
     """Histogram every FOV in ``found`` under every technique, one FOV at a time.
 
-    ``found`` is what ``h.find_region_fovs`` returns: one row per (method, FOV)
+    ``found`` is what ``v2.find_region_fovs`` returns: one row per (method, FOV)
     with the mask path. Returns ``{fov: {"edges": ..., "counts": {method: ...}}}``
     where each ``counts`` is the ``(2, n_z, n_bins)`` array
     ``accumulate_histograms`` produces -- index 0 unmasked, index 1 masked.
@@ -157,7 +157,7 @@ def load_fov(technique_roots, dapi_patches, region, fov, pattern=DAPI_PATTERN):
 
 
 def find_region_fovs_cached(technique_roots, region, **kwargs):
-    """``h.find_region_fovs`` without re-printing the skipped-FOV notice.
+    """``v2.find_region_fovs`` without re-printing the skipped-FOV notice.
 
     The region blocks already reported which FOVs were dropped; repeating it
     every time the viewer cell runs is noise.
@@ -166,7 +166,7 @@ def find_region_fovs_cached(technique_roots, region, **kwargs):
     import io
 
     with contextlib.redirect_stdout(io.StringIO()):
-        return h.find_region_fovs(technique_roots, region, **kwargs)
+        return v2.find_region_fovs(technique_roots, region, **kwargs)
 
 
 def brightness_metrics(runs) -> pd.DataFrame:
@@ -189,12 +189,12 @@ def brightness_metrics(runs) -> pd.DataFrame:
 
 
 def method_colors(methods) -> dict:
-    """Hue per technique, fixed slot order -- the same assignment ``h`` uses.
+    """Hue per technique, fixed slot order -- the same assignment ``v2`` uses.
 
-    A technique keeps its colour across every figure in both notebooks, so a
-    colour never changes meaning between them.
+    A technique keeps its colour across every figure in the repo, so a colour
+    never changes meaning between them.
     """
-    return {name: h.CATEGORICAL[i] for i, name in enumerate(methods)}
+    return v2.method_colors(methods)
 
 
 def display_range(runs, clip_quantile=CLIP_QUANTILE):
@@ -334,14 +334,14 @@ def compare_brightness_distributions(
             ax.annotate(f"above {top:,.0f}, clipped into the last bin\n"
                         + "   ".join(clipped),
                         xy=(0.98, 0.72), xycoords="axes fraction",
-                        ha="right", va="top", fontsize=8.5, color=h.INK_SECONDARY)
+                        ha="right", va="top", fontsize=8.5, color=v2.INK_SECONDARY)
 
         ax.set_title(panel_title, pad=10, loc="left")
         ax.set_xlabel("pixel brightness")
         ax.yaxis.grid(True, zorder=0)
         ax.set_axisbelow(True)
         ax.tick_params(length=0)
-        ax.spines["bottom"].set_color(h.GRID)
+        ax.spines["bottom"].set_color(v2.GRID)
         ax.spines["left"].set_visible(False)
         ax.legend(loc="upper right")
 
