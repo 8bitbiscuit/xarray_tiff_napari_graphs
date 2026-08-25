@@ -13,23 +13,37 @@ dependencies = [
     "pandas>=2.0",
     "scipy>=1.10",
     "matplotlib>=3.7",
+    # tifffile is a module-scope import in every helper, so it is not optional
+    "tifffile>=2023.1",
+    # the virtual-zarr read path: obstore fetches the bytes, virtual_tiff turns
+    # a TIFF's IFDs into a zarr manifest, and to_dask()/to_xarray() are on the
+    # default path now rather than an extra
     "zarr>=3.0",
     "virtualizarr>=2.0",
     "virtual-tiff>=0.5",
     "obstore>=0.11",
     "obspec-utils>=0.9",
+    "xarray>=2025.6",
+    "dask[array]>=2024.1",
 ]
 
 [project.optional-dependencies]
-# to_dask()/to_xarray() and the napari hand-off
-xarray = ["xarray>=2024.1", "dask[array]>=2024.1"]
-# tifffile writes the fixture TIFFs and is the reference oracle in the tests;
-# ipykernel is what runs the notebook
-dev = ["pytest>=7", "tifffile>=2023.1", "ipykernel"]
+# ipykernel is what runs the notebooks
+dev = ["pytest>=7", "ipykernel"]
+# napari is imported only inside launch_viewer, so a headless kernel needs none
+# of this to run everything else
+viewer = ["napari[all]>=0.4.19"]
 
 [tool.setuptools]
-packages = ["zspan"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-filterwarnings = ["error::DeprecationWarning:zspan.*"]
+# Flat modules, not a package -- the `zspan` package this once pointed at was
+# deleted in 3267a2b, which made `pip install -e .` fail outright.  The
+# notebooks import these from the working directory; listing them here just
+# makes the same imports work from anywhere.
+py-modules = [
+    "segmentation_loading",
+    "segmentation_helpers_v2",
+    "segmentation_brightness_helpers",
+    "segmentation_metrics",
+    "segmentation_z_area_sway_claude",
+    "segmentation_z_brightness_claude",
+]

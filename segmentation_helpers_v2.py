@@ -159,6 +159,7 @@ from matplotlib.figure import Figure
 from matplotlib.transforms import blended_transform_factory, offset_copy
 from scipy import stats as sps
 
+import segmentation_loading as sl
 import segmentation_z_area_sway_claude as sw
 import segmentation_z_brightness_claude as b
 
@@ -289,15 +290,26 @@ def measure_slice_areas(mask_volume) -> np.ndarray:
     return areas
 
 
-def available_regions(technique_roots, region_glob="region_*") -> list:
-    """Region directories present under *every* technique root, sorted."""
-    per_root = [{d.name for d in Path(root).glob(region_glob) if d.is_dir()}
-                for root in technique_roots.values()]
+def available_regions(technique_roots, region_glob="region_*", registry=None) -> list:
+    """Region directories present under *every* technique root, sorted.
+
+    With ``registry`` the listing goes through the object store instead of the
+    filesystem, so the same call works against a bucket.  Without one the
+    original ``Path.glob`` is used, which is what keeps the local notebook
+    working unchanged.
+    """
+    if registry is not None:
+        per_root = [set(sl.list_subdirs(root, registry, region_glob))
+                    for root in technique_roots.values()]
+    else:
+        per_root = [{d.name for d in Path(root).glob(region_glob) if d.is_dir()}
+                    for root in technique_roots.values()]
     return sorted(set.intersection(*per_root)) if per_root else []
 
 
 def find_region_fovs(technique_roots, region, fov_glob="fov_*",
-                     filename="masks.tif", paired_only=True) -> pd.DataFrame:
+                     filename="masks.tif", paired_only=True,
+                     registry=None) -> pd.DataFrame:
     """Locate ``<technique_root>/<region>/<fov>/masks.tif`` for every FOV found.
 
     ``technique_roots`` maps a technique name to the directory *above* the
@@ -307,6 +319,13 @@ def find_region_fovs(technique_roots, region, fov_glob="fov_*",
     """
     rows = []
     for method, root in technique_roots.items():
+        if registry is not None:
+            region_url = sl.join_url(root, region)
+            for fov in sl.list_subdirs(region_url, registry, fov_glob):
+                path = sl.join_url(region_url, fov, filename)
+                if sl.exists(path, registry):
+                    rows.append({"method": method, "fov": fov, "path": path})
+            continue
         for fov_dir in sorted((Path(root) / region).glob(fov_glob)):
             path = fov_dir / filename
             if path.exists():
@@ -685,13 +704,22 @@ def compare_profile_distribution(labels: pd.DataFrame, column: str = "jitter",
 # Part 4 -- one FOV, all three measurements
 # =============================================================================
 
-def load_dapi(dapi_glob):
+def load_dapi(dapi_glob, registry=None, pattern=DAPI_PATTERN):
     """The DAPI stack both techniques segmented, read once.
 
     Numeric z ordering — ``z10`` sorts after ``z9``, which a plain sort of the
     filenames gets wrong.  Read once per FOV and reused across techniques: the
     scripts' own loaders re-read the stack for every mask volume.
+
+    With ``registry`` the argument is the FOV *directory* (a URL) rather than a
+    glob string, because object storage has no globbing — the pattern is applied
+    to a listing instead — and the planes stream in as chunks through
+    :mod:`segmentation_loading`.  Either way the return is the same
+    ``(array, files)`` pair.
     """
+    if registry is not None:
+        return sl.load_dapi(dapi_glob, registry, pattern)
+
     files = glob.glob(str(dapi_glob))
 
     def z_index(f):
@@ -704,7 +732,16 @@ def load_dapi(dapi_glob):
     return np.stack([tifffile.imread(f) for f in files], axis=0), files
 
 
-def load_masks(path) -> np.ndarray:
+def load_masks(path, registry=None) -> np.ndarray:
+    """One label volume, resident.  ``registry`` streams it from an object store.
+
+    The array that comes back is identical either way — same shape, same dtype,
+    2D promoted to 3D — so every measurement downstream is unaffected by which
+    route it took.
+    """
+    if registry is not None:
+        return sl.load_masks(path, registry)
+
     masks = tifffile.imread(str(path))
     if masks.ndim == 2:
         masks = masks[np.newaxis]
@@ -790,10 +827,25 @@ def fov_dapi_glob(dapi_root, fov, pattern=DAPI_PATTERN):
     return str(Path(dapi_root) / fov / pattern)
 
 
+def fov_dapi_url(dapi_root, fov):
+    """The FOV *directory* as a URL, for the registry-backed :func:`load_dapi`.
+
+    A directory rather than a glob: there is nothing to glob against in an
+    object store, so the pattern is matched against a listing of this prefix.
+    """
+    return sl.join_url(dapi_root, fov)
+
+
+def _dapi_arg(dapi_root, fov, pattern, registry):
+    """What :func:`load_dapi` wants — a URL with a registry, a glob without."""
+    return (fov_dapi_url(dapi_root, fov) if registry is not None
+            else fov_dapi_glob(dapi_root, fov, pattern))
+
+
 def scan_region(found: pd.DataFrame, dapi_root=None, region: str | None = None,
                 pattern=DAPI_PATTERN, with_brightness=True, verbose=True,
                 drop_in=DROP_SINGLE_SLICE_IN, drop=DROP_SINGLE_SLICE,
-                **analysis) -> dict:
+                registry=None, **analysis) -> dict:
     """:func:`analyse_fov` on every row of ``found``; returns tidy frames.
 
     ``found`` is what :func:`find_region_fovs` returns — one row per (technique,
@@ -805,19 +857,24 @@ def scan_region(found: pd.DataFrame, dapi_root=None, region: str | None = None,
     set by the largest FOV rather than by how many there are.  Only the tables
     and the histograms survive the loop — a few hundred KB per run against
     hundreds of MB for the volumes.
+
+    ``registry`` reads both from an object store instead of the filesystem.  It
+    changes where the bytes come from and nothing else: the volumes are still
+    fully resident one at a time, and the measurements see the same arrays.
     """
     label_frames, bright_rows, filter_rows, runs = [], [], [], {}
 
     for fov, rows in found.groupby("fov", sort=True, observed=True):
         dapi, edges, exact = None, None, None
         if with_brightness and dapi_root is not None:
-            dapi, _ = load_dapi(fov_dapi_glob(dapi_root, fov, pattern))
+            dapi, _ = load_dapi(_dapi_arg(dapi_root, fov, pattern, registry),
+                                registry, pattern)
             edges, exact = b.build_bin_edges(dapi)
 
         counts_by_method = {}
         for row in rows.itertuples():
             method = str(row.method)
-            masks = load_masks(row.path)
+            masks = load_masks(row.path, registry)
             result = analyse_fov(masks, dapi=dapi, edges=edges, exact=exact,
                                  drop=drops_here(method, drop_in, drop),
                                  keep_volumes=False, **analysis)
@@ -858,7 +915,8 @@ def scan_region(found: pd.DataFrame, dapi_root=None, region: str | None = None,
 
 
 def scan_regions(technique_roots, dapi_patches=None, regions=None,
-                 pattern=DAPI_PATTERN, verbose=True, **kwargs) -> dict:
+                 pattern=DAPI_PATTERN, verbose=True, registry=None,
+                 **kwargs) -> dict:
     """:func:`scan_region` over several regions, concatenated.
 
     ``regions=None`` scans every region present under *every* technique root.
@@ -866,16 +924,21 @@ def scan_regions(technique_roots, dapi_patches=None, regions=None,
     ``technique_roots`` is, so the region name is appended here and named once.
     """
     if regions is None:
-        regions = available_regions(technique_roots)
+        regions = available_regions(technique_roots, registry=registry)
 
     parts = []
     for region in regions:
         if verbose:
             print(f"\n### {region}")
-        found = find_region_fovs(technique_roots, region)
-        dapi_root = None if dapi_patches is None else Path(dapi_patches) / region
+        found = find_region_fovs(technique_roots, region, registry=registry)
+        if dapi_patches is None:
+            dapi_root = None
+        elif registry is not None:
+            dapi_root = sl.join_url(dapi_patches, region)
+        else:
+            dapi_root = Path(dapi_patches) / region
         parts.append(scan_region(found, dapi_root, region=region, pattern=pattern,
-                                 verbose=verbose, **kwargs))
+                                 verbose=verbose, registry=registry, **kwargs))
 
     if not parts:
         raise FileNotFoundError(f"no regions found under {list(technique_roots.values())}")

@@ -27,17 +27,15 @@ being made is between techniques.
 
 from __future__ import annotations
 
-import glob
-import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import tifffile
 from matplotlib.figure import Figure
 
 import segmentation_helpers_v2 as v2
+import segmentation_loading as sl
 import segmentation_z_brightness_claude as b
 
 # CONFIG DEFAULTS
@@ -48,31 +46,18 @@ CLIP_QUANTILE = 0.999                # x-axis stops here, on the pooled distribu
 # ----------------------------------------------------------------------------
 
 
-def load_dapi(dapi_glob):
-    """The DAPI stack on its own, without a mask volume to check against.
-
-    Both techniques segment the same image, so the stack is read once per FOV
-    and reused rather than re-read per technique. Numeric z ordering -- ``z10``
-    sorts after ``z9``, which a plain sort of the filenames gets wrong.
-    """
-    files = glob.glob(dapi_glob)
-
-    def z_index(f):
-        m = re.search(r"z(\d+)", Path(f).stem)
-        return int(m.group(1)) if m else 0
-    files = sorted(files, key=z_index)
-
-    if not files:
-        raise FileNotFoundError(f"No DAPI files matched pattern: {dapi_glob}")
-    return np.stack([tifffile.imread(f) for f in files], axis=0), files
+# The DAPI loader and the path builders live in one place -- this module used to
+# carry byte-identical copies of them, which meant the object-store support had
+# to be added twice or the two would drift.  Re-exported so existing callers of
+# ``bh.load_dapi`` keep working.
+load_dapi = v2.load_dapi
+fov_dapi_glob = v2.fov_dapi_glob
+fov_dapi_url = v2.fov_dapi_url
+load_masks = v2.load_masks
 
 
-def fov_dapi_glob(dapi_root, fov, pattern=DAPI_PATTERN):
-    """``<dapi_root>/<fov>/DAPI_decon_z*.tif`` -- the image both techniques saw."""
-    return str(Path(dapi_root) / fov / pattern)
-
-
-def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True):
+def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True,
+                           registry=None):
     """Histogram every FOV in ``found`` under every technique, one FOV at a time.
 
     ``found`` is what ``v2.find_region_fovs`` returns: one row per (method, FOV)
@@ -87,14 +72,13 @@ def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True)
     runs = {}
 
     for fov, rows in found.groupby("fov", sort=True, observed=True):
-        dapi, files = load_dapi(fov_dapi_glob(dapi_root, fov, pattern))
+        dapi, files = load_dapi(
+            v2._dapi_arg(dapi_root, fov, pattern, registry), registry, pattern)
         edges, exact = b.build_bin_edges(dapi)
         counts = {}
 
         for row in rows.itertuples():
-            masks = tifffile.imread(row.path)
-            if masks.ndim == 2:
-                masks = masks[np.newaxis]
+            masks = load_masks(row.path, registry)
             if masks.shape != dapi.shape:
                 raise ValueError(f"{fov} / {row.method}: masks shape {masks.shape} "
                                  f"!= dapi shape {dapi.shape}")
@@ -117,7 +101,8 @@ def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True)
     return runs
 
 
-def load_fov(technique_roots, dapi_patches, region, fov, pattern=DAPI_PATTERN):
+def load_fov(technique_roots, dapi_patches, region, fov, pattern=DAPI_PATTERN,
+             registry=None):
     """Everything one FOV needs, without scanning its region first.
 
     ``dapi_patches`` is the directory *above* the region, the same way
@@ -129,21 +114,22 @@ def load_fov(technique_roots, dapi_patches, region, fov, pattern=DAPI_PATTERN):
     both mask volumes are histogrammed onto bins built from it, exactly as
     :func:`scan_region_brightness` does.
     """
-    found = find_region_fovs_cached(technique_roots, region)
+    found = find_region_fovs_cached(technique_roots, region, registry=registry)
     rows = found[found["fov"] == fov]
     if rows.empty:
         raise FileNotFoundError(
             f"{fov} is not a paired FOV in {region}; "
             f"have: {', '.join(sorted(found['fov'].unique()))}")
 
-    dapi, _ = load_dapi(fov_dapi_glob(Path(dapi_patches) / region, fov, pattern))
+    dapi_root = (sl.join_url(dapi_patches, region) if registry is not None
+                 else Path(dapi_patches) / region)
+    dapi, _ = load_dapi(v2._dapi_arg(dapi_root, fov, pattern, registry),
+                        registry, pattern)
     edges, exact = b.build_bin_edges(dapi)
 
     masks, counts = {}, {}
     for row in rows.itertuples():
-        volume = tifffile.imread(row.path)
-        if volume.ndim == 2:
-            volume = volume[np.newaxis]
+        volume = load_masks(row.path, registry)
         if volume.shape != dapi.shape:
             raise ValueError(f"{region} / {fov} / {row.method}: masks shape "
                              f"{volume.shape} != dapi shape {dapi.shape}")
