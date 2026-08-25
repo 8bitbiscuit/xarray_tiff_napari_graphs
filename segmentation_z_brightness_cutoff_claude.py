@@ -92,12 +92,12 @@ PREPROCESSING = "decon"
 MODEL = "VePo"
 
 TECHNIQUE_ROOTS = {
-    "3D true":     DATA_ROOT / "segmentations_3d_true"     / FAMILY / PREPROCESSING / MODEL,
+    "3D true":     DATA_ROOT / "cpsam_v2_2" / "decon_decon_kde-median" / "VePo",
     "3D stitched": DATA_ROOT / "segmentations_3d_stitched" / FAMILY / PREPROCESSING / MODEL,
 }
 DAPI_PATCHES = DATA_ROOT / "patches" / MODEL
 
-REGION = "region_UWA-7648"
+REGION = "region_UCI-2424"
 FOV = "fov_07"
 
 # The rule this whole script is about. Absolute, in the units of the image, so
