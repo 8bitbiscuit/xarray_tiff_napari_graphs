@@ -1,35 +1,49 @@
-"""Helpers for ``segmentation_comparison_v2.ipynb`` — every script's measurement
-on one scorecard.
+"""Helpers for ``segmentation_comparison_v2.ipynb`` and
+``segmentation_comparison_s3.ipynb`` — every measurement on one scorecard.
 
-Three measurements, taken from the repo's scripts and run on the same volumes:
+Three measurements, run on the same volumes:
 
-===========================================  ==========================================
-z-span (Part 0-1 below)                      how far does each mask reach through z
-``segmentation_z_area_sway_claude.py``       does the area-through-z profile wander up
-                                             and down, or step in one jump
-``segmentation_z_brightness_claude.py``      do the voxels a technique claims actually
-                                             look like signal
-===========================================  ==========================================
+=========================  ==============================================
+z-span (Part 1)            how far does each mask reach through z
+area profile (Part 2)      does the area-through-z profile wander up and
+                           down, or step in one jump
+brightness (Part 3)        do the voxels a technique claims actually look
+                           like signal
+=========================  ==============================================
 
-The z-span half is Part 0 below — the palette, the theme, the region walk, the
-per-plane areas and the span figure — so this module and the two scripts above
-are the whole dependency chain.  The z bounding box is read off the areas array
-by :func:`span_table` rather than by a second ``find_objects`` pass, since the
-areas are what every other measurement here already needs.
+**This module is where those measurements live, and it imports nothing from
+``napari_scripts/``.**  Its only repo import is ``segmentation_loading``, which
+is what puts the object-store read path behind the same calls.  It imports on a
+machine with no napari and no Qt — ``import napari`` appears only inside
+:func:`launch_viewer` and :func:`make_3d`, the two functions that need it.
 
-Two scripts are deliberately not aggregated.
+The direction is deliberate and it is one-way.  ``napari_scripts/`` holds
+scripts: a CONFIG block, a ``main()``, a viewer at the end.  A library that
+imported one would inherit that CONFIG, so editing a script would silently move
+the notebook's numbers.  Every script that wants a measurement calls **into**
+here instead — ``segmentation_z_jitter.py`` and ``segmentation_z_area_sway.py``
+both call :func:`check_area_jitter` / :func:`flag_jitter`, and
+``segmentation_z_brightness.py`` and ``segmentation_z_brightness_bimodal.py``
+both call :func:`vectorise_pixels` / :func:`accumulate_histograms` — so a script
+and the notebook's scorecard cannot drift apart.
 
-``segmentation_z_kanai_only.py`` does ``import napari`` at module scope, which a
-headless kernel cannot do, and its z-span maths is the first row of the table.
+The z bounding box is read off the areas array by :func:`span_table` rather than
+by a second ``find_objects`` pass, since the areas are what every other
+measurement here already needs.
 
-**Per-transition area change is not measured here at all** — the second half of
-``segmentation_z_claude.py`` and the whole of
-``segmentation_z_claude_log_cutoff.py``.  |Δ area| / area asks *how much did this
-mask's cross-section change between two planes*, which is large for a healthy
-nucleus growing steeply toward its mid-plane, so it ranks the healthiest steep
-growers above real defects.  ``jitter`` and ``sway`` between them ask the two
-questions worth asking — did the profile turn around, and did it jump — and both
-score a monotone grower at exactly 1.0 however fast it grows.
+One script is deliberately not aggregated.
+``napari_scripts/segmentation_z_kanai_only.py`` does ``import napari`` at module
+scope, which a headless kernel cannot do, and its z-span maths is the first row
+of the table.
+
+**Per-transition area change is not measured here at all** — the question
+``napari_scripts/segmentation_z_log_cutoff.py`` asks.  |Δ area| / area asks *how
+much did this mask's cross-section change between two planes*, which is large
+for a healthy nucleus growing steeply toward its mid-plane, so it ranks the
+healthiest steep growers above real defects.  ``jitter`` and ``sway`` between
+them ask the two questions worth asking — did the profile turn around, and did
+it jump — and both score a monotone grower at exactly 1.0 however fast it
+grows.
 
 **A note on what ``sway`` used to be.**  Until this rework a single metric,
 ``sway = 10 ** max |Δ² log a|``, stood for both.  It could not tell them apart:
@@ -44,11 +58,9 @@ for the question it was supposed to answer, ``sway`` keeps the name and the old
 maths for the over-merge it really did catch, and both now exclude slivers.
 
 This module reduces the three to **one row per (region, FOV, technique)** —
-individual statistics, then three group scores, then a weighted total out of
-1.00.  It re-implements none of the
-measurements: ``check_area_jitter`` / ``check_area_sway``, ``vectorise_pixels`` /
-``accumulate_histograms`` and the histogram statistics are imported from the
-scripts and called.  What is new here is the three things none of them has.
+individual statistics, then four group scores, then a weighted total out of
+1.00.  What is new here, over what any one script asks, is three things none of
+them has.
 
 1. The single-slice filter
 --------------------------
@@ -160,8 +172,6 @@ from matplotlib.transforms import blended_transform_factory, offset_copy
 from scipy import stats as sps
 
 import segmentation_loading as sl
-import segmentation_z_area_sway_claude as sw
-import segmentation_z_brightness_claude as b
 
 # CONFIG DEFAULTS
 # ----------------------------------------------------------------------------
@@ -191,6 +201,9 @@ SLIVER_FRAC = 0.05                   # a plane under this share of the mask's pe
 
 # --- brightness --------------------------------------------------------------
 OVERLAP_QUANTILE = 0.5               # the napari bright-unmasked / dim-masked thresholds
+FLOAT_HIST_BINS = 4096               # bins a non-integer volume is histogrammed onto
+MAX_EXACT_BINS = 1 << 17             # an integer volume narrower than this gets one bin
+                                     # per intensity value instead
 # ----------------------------------------------------------------------------
 
 
@@ -514,13 +527,446 @@ def drops_here(method, drop_in=DROP_SINGLE_SLICE_IN, drop=DROP_SINGLE_SLICE) -> 
 
 
 # =============================================================================
-# Part 2 -- brightness statistics that do not assume a shape
+# Part 2 -- the area profile: jitter (wobble) and sway (jump)
 # =============================================================================
+# ``napari_scripts/segmentation_z_jitter.py`` and
+# ``napari_scripts/segmentation_z_area_sway.py`` call these rather than carrying
+# their own copies, so a script and the scorecard cannot disagree about a volume.
+# Both metrics read the per-plane areas :func:`measure_slice_areas` already
+# produced, and both are dimensionless factors starting at 1.0, so an absolute
+# cutoff means the same thing in every FOV.
+
+def kept_planes(areas: np.ndarray, area_floor=AREA_FLOOR,
+                sliver_frac=SLIVER_FRAC) -> np.ndarray:
+    """Which planes are a real cross-section of each mask, as a boolean array.
+
+    A plane is dropped when it holds fewer than ``area_floor`` px, or less than
+    ``sliver_frac`` of that mask's own peak area.  Both tests are needed and the
+    relative one does the work: every nucleus enters and leaves the stack through
+    a partial-volume sliver, and a sliver against a mid-plane is a ratio of
+    hundreds to one that says where the nucleus met the edge of the volume rather
+    than anything about the segmentation.
+
+    This replaces flooring the areas before the log.  Flooring *clamped* a 16 px
+    onset plane to 20 px and then measured it anyway, which left a ~100x step in
+    every mask's profile by construction — the artifact that made the old sway
+    metric a ranking of onset steepness.  Excluding the plane is what the floor
+    was always meant to do.
+    """
+    present = areas > 0
+    peak = areas.max(axis=0)
+    return present & (areas >= area_floor) & (areas >= sliver_frac * peak)
+
+
+JITTER_COLUMNS = ["label", "n_planes", "n_planes_used", "area_min", "area_max",
+                  "n_reversals", "jitter", "z_at_jitter"]
+
+
+def check_area_jitter(areas: np.ndarray, area_floor=AREA_FLOOR,
+                      sliver_frac=SLIVER_FRAC) -> pd.DataFrame:
+    """One row per label: how much its area profile wanders up and down.
+
+    Sway asks *how sharp is the worst corner*, which is a question about a single
+    transition and is answered identically by a corner and by a steep monotone
+    ramp.  This asks a different one — **how often, and how far, does the profile
+    reverse direction** — which is the question a jittery mask fails and a ramp,
+    however violent, does not::
+
+        d[k]     = log10 a[k+1] - log10 a[k]        per-step log growth
+        reversal = sign(d[k]) != sign(d[k+1])       direction turned around
+        w[k]     = min(|d[k]|, |d[k+1]|)            how deep the V goes
+        jitter   = 10 ** sum(w over reversals)      a factor, >= 1.0
+
+    Two choices carry the metric.  Weighting a reversal by the **smaller** of its
+    two limbs is what makes a ramp cost nothing: a huge rise followed by a tiny
+    dip is worth the tiny dip, not the huge rise, so the onset ramp that
+    dominated sway cannot dominate this even when a sliver survives the filter.
+    And **summing** rather than taking the max is what lets many small wobbles
+    outscore one big excursion — under a max, ten alternating 1.5x wobbles score
+    1.5x and a single monotone jump scores 50x, which is exactly backwards.
+
+    A monotone profile scores exactly 1.0 at any steepness.  A healthy nucleus is
+    unimodal — it grows to its mid-plane and shrinks — so it contains one
+    reversal at the peak and lands a little above 1.0, typically 1.1-1.3; that
+    peak is **not** exempt, so the cutoff has to sit above the ordinary bulk
+    rather than at 1.0.  ``JITTER_CUTOFF = 1.75`` is a provisional value from
+    worked profiles, not from this data: derive it from the pooled distribution
+    with :func:`compare_profile_distribution` before trusting it.
+
+    ``z_at_jitter`` is the middle plane of the deepest reversal — the plane to
+    scroll to in napari — and is -1 for a mask that never reverses.
+    """
+    present = areas > 0
+    labels = np.flatnonzero(present.any(axis=0))
+    labels = labels[labels > 0]                       # drop background
+    if labels.size == 0:
+        return pd.DataFrame(columns=JITTER_COLUMNS)
+
+    keep = kept_planes(areas, area_floor, sliver_frac)
+    log_area = np.log10(np.maximum(areas, 1))
+
+    if areas.shape[0] >= 3:
+        step_ok = keep[:-1] & keep[1:]              # both ends of this step survive
+        d = np.where(step_ok, log_area[1:] - log_area[:-1], 0.0)
+
+        triple = step_ok[:-1] & step_ok[1:]         # three consecutive kept planes
+        # a flat step has sign 0, so its product is 0 and it is not a reversal:
+        # the profile has to actually turn around, not merely stop rising
+        reversed_here = triple & (np.sign(d[:-1]) * np.sign(d[1:]) < 0)
+        depth = np.where(reversed_here,
+                         np.minimum(np.abs(d[:-1]), np.abs(d[1:])), 0.0)
+
+        measurable = triple.any(axis=0)
+        n_reversals = reversed_here.sum(axis=0)
+        jitter = np.where(measurable, 10.0 ** depth.sum(axis=0), np.nan)
+        z_at_jitter = np.where(n_reversals > 0, depth.argmax(axis=0) + 1, -1)
+    else:
+        n_reversals = np.zeros(areas.shape[1], dtype=np.int64)
+        jitter = np.full(areas.shape[1], np.nan)
+        z_at_jitter = np.full(areas.shape[1], -1)
+
+    absent_high = np.where(present, areas, np.iinfo(np.int64).max)
+
+    return pd.DataFrame({
+        "label": labels.astype(np.int64),
+        "n_planes": present.sum(axis=0)[labels],
+        "n_planes_used": keep.sum(axis=0)[labels],
+        "area_min": absent_high.min(axis=0)[labels],
+        "area_max": areas.max(axis=0)[labels],
+        "n_reversals": n_reversals[labels].astype(np.int64),
+        "jitter": jitter[labels],
+        "z_at_jitter": z_at_jitter[labels],
+    })
+
+
+SWAY_COLUMNS = ["label", "n_planes", "n_planes_used", "area_min", "area_max",
+                "sway", "z_at_sway"]
+
+
+def check_area_sway(areas: np.ndarray, area_floor=AREA_FLOOR,
+                    sliver_frac=SLIVER_FRAC) -> pd.DataFrame:
+    """One row per label: the sharpest corner in its area-through-z profile::
+
+        sway = 10 ** max | log10 a[z+1] - 2 log10 a[z] + log10 a[z-1] |
+
+    the largest second difference of log area over three consecutive planes, read
+    back as a factor.  It is the change in *growth rate* from one step to the
+    next, so a mask growing at a constant rate scores 1.0 no matter how fast it
+    grows, a gentle arc scores a little over 1, and a mask that steps by 10x in
+    one plane and is flat either side scores about 10 — the flat/jump/flat
+    profile of an over-merge, which is monotone and so scores a clean 1.0 jitter.
+
+    Only triples of *consecutive kept* planes count, so a mask stitched across a
+    z gap does not score a sway for the hole, and appearing or disappearing is
+    not a corner.  ``z_at_sway`` is the middle plane of the worst triple — the
+    plane to scroll to in napari.
+    """
+    present = areas > 0
+    labels = np.flatnonzero(present.any(axis=0))
+    labels = labels[labels > 0]                       # drop background
+    if labels.size == 0:
+        return pd.DataFrame(columns=SWAY_COLUMNS)
+
+    keep = kept_planes(areas, area_floor, sliver_frac)
+    log_area = np.log10(np.maximum(areas, 1))
+
+    if areas.shape[0] >= 3:
+        triple = keep[:-2] & keep[1:-1] & keep[2:]
+        # second difference: how much the growth rate changed at the middle plane
+        curvature = np.abs(log_area[2:] - 2.0 * log_area[1:-1] + log_area[:-2])
+        curvature = np.where(triple, curvature, -1.0)
+        measurable = triple.any(axis=0)
+        sway = np.where(measurable, 10.0 ** curvature.max(axis=0), np.nan)
+        z_at_sway = np.where(measurable, curvature.argmax(axis=0) + 1, -1)
+    else:
+        sway = np.full(areas.shape[1], np.nan)
+        z_at_sway = np.full(areas.shape[1], -1)
+
+    absent_high = np.where(present, areas, np.iinfo(np.int64).max)
+
+    return pd.DataFrame({
+        "label": labels.astype(np.int64),
+        "n_planes": present.sum(axis=0)[labels],
+        "n_planes_used": keep.sum(axis=0)[labels],
+        "area_min": absent_high.min(axis=0)[labels],
+        "area_max": areas.max(axis=0)[labels],
+        "sway": sway[labels],
+        "z_at_sway": z_at_sway[labels],
+    })
+
+
+def flag_metric(df: pd.DataFrame, column: str, cutoff, quantile: float = 0.90,
+                flag: str | None = None):
+    """Add a boolean flag for ``column`` exceeding ``cutoff``.
+
+    Returns ``(df, cutoff, source)``.  ``cutoff=None`` falls back to the
+    ``quantile`` of the values that exist — a rank statistic, so nothing is
+    assumed about the distribution's shape and masks too short to be measured
+    cannot drag it down.  The notebook always passes an absolute cutoff: a
+    quantile flags the top 10% of every FOV *by construction*, which makes a
+    fixed-size shortlist to look at and a useless number to compare techniques
+    on, since both would score 10.0% every time.
+    """
+    flag = flag or f"large_{column}"
+    df = df.copy()
+    if df.empty:
+        df[flag] = pd.Series(dtype=bool)
+        return df, float("inf"), "no masks"
+
+    if cutoff is None:
+        values = df[column].dropna()
+        cutoff = float(values.quantile(quantile)) if len(values) else float("inf")
+        source = f"p{100 * quantile:g} of this FOV's {column} values"
+    else:
+        cutoff, source = float(cutoff), "set in CONFIG"
+
+    df[flag] = df[column] > cutoff        # NaN compares False
+    return df, cutoff, source
+
+
+def flag_jitter(jitters: pd.DataFrame, cutoff=JITTER_CUTOFF, quantile: float = 0.90):
+    """Add ``large_jitter``.  Returns ``(jitters, cutoff, source)``."""
+    return flag_metric(jitters, "jitter", cutoff, quantile, flag="large_jitter")
+
+
+def flag_sway(sways: pd.DataFrame, cutoff=SWAY_CUTOFF, quantile: float = 0.90):
+    """Add ``large_sway``.  Returns ``(sways, cutoff, source)``."""
+    return flag_metric(sways, "sway", cutoff, quantile, flag="large_sway")
+
+
+# =============================================================================
+# Part 3 -- brightness: the histograms, and statistics that assume no shape
+# =============================================================================
+# ``napari_scripts/segmentation_z_brightness.py`` and
+# ``segmentation_z_brightness_bimodal.py`` call these rather than carrying their
+# own copies.  Every statistic below reads off the counts rather than the voxels,
+# so peak memory is one z plane and two mask volumes over the same image can be
+# compared exactly — as long as they were histogrammed onto the *same* bins,
+# which is why :func:`accumulate_histograms` takes its edges as an argument.
+
+def vectorise_pixels(dapi: np.ndarray, masks: np.ndarray):
+    """Collapse ``(n_z, y, x)`` to ``(n_z, n_pixels)``: one column per pixel.
+
+    Column j of both arrays is the same ``(y, x)`` location seen through the
+    whole stack, so ``brightness[:, j]`` and ``present[:, j]`` are that pixel's
+    brightness and mask-membership vectors.
+    """
+    if dapi.shape != masks.shape:
+        raise ValueError(f"masks shape {masks.shape} != dapi shape {dapi.shape}")
+
+    n_z = dapi.shape[0]
+    return dapi.reshape(n_z, -1), (masks > 0).reshape(n_z, -1)
+
+
+def build_bin_edges(brightness: np.ndarray, n_bins: int = FLOAT_HIST_BINS,
+                    max_exact_bins: int = MAX_EXACT_BINS):
+    """Bin edges covering the whole volume, one bin per value where that is cheap.
+
+    Returns ``(edges, exact)``.  Build them **once per FOV, from the DAPI stack**
+    both techniques segmented, and pass the pair to every
+    :func:`accumulate_histograms` call for that FOV.
+    """
+    vmin, vmax = float(brightness.min()), float(brightness.max())
+
+    if np.issubdtype(brightness.dtype, np.integer) and (vmax - vmin) < max_exact_bins:
+        lo = int(vmin)
+        n = int(vmax) - lo + 1
+        return np.arange(n + 1, dtype=np.float64) + (lo - 0.5), True
+
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    return np.linspace(vmin, vmax, n_bins + 1), False
+
+
+def accumulate_histograms(brightness: np.ndarray, present: np.ndarray,
+                          edges: np.ndarray, exact: bool = False) -> np.ndarray:
+    """Fill per-z histograms on bins you already have.
+
+    Returns counts of shape ``(2, n_z, n_bins)``; index 0 is unmasked, 1 is
+    masked.  Histogramming per slice instead of keeping the two value arrays
+    around means peak memory stays at one z slice, and every statistic below
+    (quantiles, AUC, correlation) reads off these counts.
+
+    ``edges`` must span the data — pass what :func:`build_bin_edges` returned for
+    this volume, or for another volume known to cover the same range.  Taking the
+    bins as an argument is what lets two mask volumes over the *same* image be
+    histogrammed onto identical bins, which is the only way their distributions
+    can be laid over each other.
+    """
+    n_z = brightness.shape[0]
+    n_bins = edges.size - 1
+    counts = np.zeros((2, n_z, n_bins), dtype=np.int64)
+    lo = int(round(edges[0] + 0.5)) if exact else None
+
+    for z in range(n_z):
+        vals = brightness[z]
+        masked_vals = vals[present[z]]
+
+        if exact:
+            index = np.clip(vals.ravel().astype(np.int64) - lo, 0, n_bins - 1)
+            total = np.bincount(index, minlength=n_bins)
+            hit = np.bincount(np.clip(masked_vals.astype(np.int64) - lo, 0, n_bins - 1),
+                              minlength=n_bins)
+        else:
+            total, _ = np.histogram(vals, bins=edges)
+            hit, _ = np.histogram(masked_vals, bins=edges)
+
+        counts[1, z] = hit
+        counts[0, z] = total - hit
+
+    return counts
+
+
+# --- statistics read straight off the histograms -----------------------------
+
+def bin_centers(edges: np.ndarray) -> np.ndarray:
+    return 0.5 * (edges[:-1] + edges[1:])
+
+
+def rebin(counts: np.ndarray, edges: np.ndarray, new_edges: np.ndarray) -> np.ndarray:
+    """Aggregate fine bins into display bins; anything outside falls in the end bins."""
+    centers = bin_centers(edges)
+    idx = np.searchsorted(new_edges, centers, side="right") - 1
+    idx = np.clip(idx, 0, new_edges.size - 2)
+    return np.bincount(idx, weights=counts, minlength=new_edges.size - 1)
+
+
+def hist_quantile(counts: np.ndarray, edges: np.ndarray, q: float) -> float:
+    """Quantile of a binned distribution, interpolated inside the straddled bin."""
+    total = counts.sum()
+    if total == 0:
+        return float("nan")
+
+    cum = np.cumsum(counts)
+    target = q * total
+    i = min(int(np.searchsorted(cum, target, side="left")), counts.size - 1)
+    below = cum[i] - counts[i]
+    frac = 0.0 if counts[i] == 0 else (target - below) / counts[i]
+    frac = min(max(frac, 0.0), 1.0)
+    return float(edges[i] + frac * (edges[i + 1] - edges[i]))
+
+
+def hist_moments(counts: np.ndarray, centers: np.ndarray):
+    """``(mean, population sd)`` of a binned distribution."""
+    n = counts.sum()
+    if n == 0:
+        return float("nan"), float("nan")
+
+    mean = float((counts * centers).sum() / n)
+    var = float((counts * (centers - mean) ** 2).sum() / n)
+    return mean, float(np.sqrt(max(var, 0.0)))
+
+
+def hist_auc(counts_a: np.ndarray, counts_b: np.ndarray) -> float:
+    """P(a > b) + 0.5 P(a == b) — the common-language effect size / Mann-Whitney AUC.
+
+    0.5 means the two groups are indistinguishable by brightness alone; 1.0 means
+    every voxel in ``a`` outshines every voxel in ``b``.  Rank-based, so the two
+    groups being wildly different sizes costs it nothing.
+    """
+    na, nb = counts_a.sum(), counts_b.sum()
+    if na == 0 or nb == 0:
+        return float("nan")
+
+    strictly_below = np.concatenate([[0.0], np.cumsum(counts_b)[:-1]])
+    wins = (counts_a * (strictly_below + 0.5 * counts_b)).sum()
+    return float(wins / (na * nb))
+
+
+def hist_point_biserial(counts_masked: np.ndarray, counts_unmasked: np.ndarray,
+                        centers: np.ndarray) -> float:
+    """Pearson r between the mask indicator and brightness, over all voxels."""
+    n1, n0 = counts_masked.sum(), counts_unmasked.sum()
+    n = n1 + n0
+    if n1 == 0 or n0 == 0:
+        return float("nan")
+
+    m1, _ = hist_moments(counts_masked, centers)
+    m0, _ = hist_moments(counts_unmasked, centers)
+    _, sd = hist_moments(counts_masked + counts_unmasked, centers)
+    if not sd:
+        return float("nan")
+
+    return float((m1 - m0) / sd * np.sqrt((n1 / n) * (n0 / n)))
+
+
+STAT_COLUMNS = ["z", "n_pixels", "n_masked", "frac_masked",
+                "mean_masked", "mean_unmasked",
+                "median_masked", "median_unmasked",
+                "p25_masked", "p75_masked", "p25_unmasked", "p75_unmasked",
+                "auc", "point_biserial_r"]
+
+
+def _group_stats(masked: np.ndarray, unmasked: np.ndarray, edges: np.ndarray,
+                 z=None) -> dict:
+    """Location, spread and separation of one masked/unmasked pair of histograms."""
+    centers = bin_centers(edges)
+    n1, n0 = int(masked.sum()), int(unmasked.sum())
+    n = n1 + n0
+
+    mean_masked, _ = hist_moments(masked, centers)
+    mean_unmasked, _ = hist_moments(unmasked, centers)
+
+    return {
+        "z": z,
+        "n_pixels": n,
+        "n_masked": n1,
+        "frac_masked": (n1 / n) if n else float("nan"),
+        "mean_masked": mean_masked,
+        "mean_unmasked": mean_unmasked,
+        "median_masked": hist_quantile(masked, edges, 0.5),
+        "median_unmasked": hist_quantile(unmasked, edges, 0.5),
+        "p25_masked": hist_quantile(masked, edges, 0.25),
+        "p75_masked": hist_quantile(masked, edges, 0.75),
+        "p25_unmasked": hist_quantile(unmasked, edges, 0.25),
+        "p75_unmasked": hist_quantile(unmasked, edges, 0.75),
+        "auc": hist_auc(masked, unmasked),
+        "point_biserial_r": hist_point_biserial(masked, unmasked, centers),
+    }
+
+
+def summarise_by_z(counts: np.ndarray, edges: np.ndarray) -> pd.DataFrame:
+    """One row of brightness statistics per z slice."""
+    rows = [_group_stats(counts[1, z], counts[0, z], edges, z=z)
+            for z in range(counts.shape[1])]
+    if not rows:
+        return pd.DataFrame(columns=STAT_COLUMNS)
+    return pd.DataFrame(rows, columns=STAT_COLUMNS)
+
+
+def summarise_pooled(counts: np.ndarray, edges: np.ndarray) -> pd.Series:
+    """The same statistics over the whole stack.
+
+    ``auc`` is the separability :func:`brightness_stats` renames and the
+    scorecard's ``Signal`` line scores; the rest are the location and spread of
+    the two groups, in the units of the image.
+    """
+    stats = _group_stats(counts[1].sum(axis=0), counts[0].sum(axis=0), edges)
+    stats.pop("z")
+    return pd.Series(stats)
+
+
+def build_histograms(brightness: np.ndarray, present: np.ndarray,
+                     n_bins: int = FLOAT_HIST_BINS,
+                     max_exact_bins: int = MAX_EXACT_BINS):
+    """Per-z brightness histograms, split by mask presence, on bins of their own.
+
+    The one-volume shortcut.  Two volumes over the *same* image must share bins,
+    so those call :func:`build_bin_edges` once and pass the result to
+    :func:`accumulate_histograms` twice instead.
+    """
+    edges, exact = build_bin_edges(brightness, n_bins=n_bins,
+                                   max_exact_bins=max_exact_bins)
+    return edges, accumulate_histograms(brightness, present, edges, exact=exact)
+
+
+# --- and the three this module adds ------------------------------------------
+
 
 def hist_cdf_at(counts: np.ndarray, edges: np.ndarray, x: float) -> float:
     """Fraction of a binned distribution at or below ``x``.
 
-    The inverse of ``b.hist_quantile``, interpolating inside the straddled bin
+    The inverse of :func:`hist_quantile`, interpolating inside the straddled bin
     the same way, so ``hist_cdf_at(c, e, hist_quantile(c, e, q)) == q``.
     """
     total = counts.sum()
@@ -568,7 +1014,7 @@ def brightness_stats(counts: np.ndarray, edges: np.ndarray) -> pd.Series:
                              a Cohen's d would report, with medians and an IQR in
                              place of means and an SD.
     """
-    pooled = b.summarise_pooled(counts, edges)
+    pooled = summarise_pooled(counts, edges)
     masked = counts[1].sum(axis=0)
     unmasked = counts[0].sum(axis=0)
 
@@ -598,7 +1044,7 @@ def brightness_stats(counts: np.ndarray, edges: np.ndarray) -> pd.Series:
 
 
 # =============================================================================
-# Part 3 -- the distribution figure
+# Part 4 -- the distribution figure
 # =============================================================================
 
 def _log_distribution(ax, values_by_method, lo, top, n_bins=45, marks=("median",)):
@@ -701,7 +1147,7 @@ def compare_profile_distribution(labels: pd.DataFrame, column: str = "jitter",
 
 
 # =============================================================================
-# Part 4 -- one FOV, all three measurements
+# Part 5 -- one FOV, all three measurements
 # =============================================================================
 
 def load_dapi(dapi_glob, registry=None, pattern=DAPI_PATTERN):
@@ -774,17 +1220,17 @@ def analyse_fov(masks, dapi=None, edges=None, exact=None, drop=DROP_SINGLE_SLICE
     spans["thin"] = spans["z_span"] <= thin_max
     spans["deep"] = spans["z_span"] >= deep_min
 
-    # the sway script's own functions, on the filtered areas.  A single-slice mask
-    # could never have been measured anyway -- both metrics need three
-    # consecutive planes -- so the filter changes the denominator here, not the
-    # numerator.  Both read the same sliver rule, so a partial-volume onset plane
-    # is out of the profile before either of them looks at it.
-    jitters = sw.check_area_jitter(areas, area_floor=area_floor,
-                                   sliver_frac=sliver_frac)
-    jitters, jitter_cut, jitter_source = sw.flag_jitter(jitters, cutoff=jitter_cutoff)
+    # the two profile metrics, on the filtered areas.  A single-slice mask could
+    # never have been measured anyway -- both need three consecutive planes -- so
+    # the filter changes the denominator here, not the numerator.  Both read the
+    # same sliver rule, so a partial-volume onset plane is out of the profile
+    # before either of them looks at it.
+    jitters = check_area_jitter(areas, area_floor=area_floor,
+                                sliver_frac=sliver_frac)
+    jitters, jitter_cut, jitter_source = flag_jitter(jitters, cutoff=jitter_cutoff)
 
-    sways = sw.check_area_sway(areas, area_floor=area_floor, sliver_frac=sliver_frac)
-    sways, sway_cut, sway_source = sw.flag_sway(sways, cutoff=sway_cutoff)
+    sways = check_area_sway(areas, area_floor=area_floor, sliver_frac=sliver_frac)
+    sways, sway_cut, sway_source = flag_sway(sways, cutoff=sway_cutoff)
 
     labels = spans.merge(
         jitters[["label", "n_planes_used", "n_reversals", "jitter", "z_at_jitter",
@@ -804,12 +1250,12 @@ def analyse_fov(masks, dapi=None, edges=None, exact=None, drop=DROP_SINGLE_SLICE
         if dapi.shape != kept.shape:
             raise ValueError(f"masks shape {kept.shape} != dapi shape {dapi.shape}")
         if edges is None:
-            edges, exact = b.build_bin_edges(dapi)
+            edges, exact = build_bin_edges(dapi)
         elif exact is None:
             # bins of width 1 are what build_bin_edges emits for an integer volume
             exact = bool(np.allclose(np.diff(edges), 1.0))
-        brightness, present = b.vectorise_pixels(dapi, kept)
-        counts = b.accumulate_histograms(brightness, present, edges, exact=exact)
+        brightness, present = vectorise_pixels(dapi, kept)
+        counts = accumulate_histograms(brightness, present, edges, exact=exact)
         out.update(brightness=brightness_stats(counts, edges), counts=counts,
                    edges=edges)
 
@@ -819,7 +1265,7 @@ def analyse_fov(masks, dapi=None, edges=None, exact=None, drop=DROP_SINGLE_SLICE
 
 
 # =============================================================================
-# Part 5 -- every FOV in a region, every region in a run
+# Part 6 -- every FOV in a region, every region in a run
 # =============================================================================
 
 def fov_dapi_glob(dapi_root, fov, pattern=DAPI_PATTERN):
@@ -869,7 +1315,7 @@ def scan_region(found: pd.DataFrame, dapi_root=None, region: str | None = None,
         if with_brightness and dapi_root is not None:
             dapi, _ = load_dapi(_dapi_arg(dapi_root, fov, pattern, registry),
                                 registry, pattern)
-            edges, exact = b.build_bin_edges(dapi)
+            edges, exact = build_bin_edges(dapi)
 
         counts_by_method = {}
         for row in rows.itertuples():
@@ -955,7 +1401,7 @@ def scan_regions(technique_roots, dapi_patches=None, regions=None,
 
 
 # =============================================================================
-# Part 6 -- one row per FOV per technique, then the scores
+# Part 7 -- one row per FOV per technique, then the scores
 # =============================================================================
 
 def _group_keys(frame: pd.DataFrame) -> list:
@@ -1094,7 +1540,7 @@ SCORE_COLUMNS = ("Span", "Jitter", "Sway", "Signal", TOTAL_COLUMN)
 
 
 def score_fovs(metrics: pd.DataFrame, weights: dict | None = None) -> pd.DataFrame:
-    """Three group scores and the weighted ``Total`` they earn out of 1.00.
+    """Four group scores and the weighted ``Total`` they earn out of 1.00.
 
     ``Span       = 1 - pct_thin / 100``
         masks too short to keep — the share of a technique's output that a
@@ -1215,7 +1661,7 @@ def score_fovs(metrics: pd.DataFrame, weights: dict | None = None) -> pd.DataFra
 
 
 # =============================================================================
-# Part 7 -- the scorecard figure
+# Part 8 -- the scorecard figure
 # =============================================================================
 
 def _row_labels(index, row_sep=" · ") -> list:
@@ -1337,7 +1783,7 @@ def plot_scorecard(metrics: pd.DataFrame, spec=SCORECARD_SPEC,
 
 
 # =============================================================================
-# Part 8 -- is the difference real?  Paired, rank-based, no normal anywhere
+# Part 9 -- is the difference real?  Paired, rank-based, no normal anywhere
 # =============================================================================
 
 def _hodges_lehmann(diffs: np.ndarray) -> float:
@@ -1548,7 +1994,7 @@ def technique_summary(metrics: pd.DataFrame, scores: pd.DataFrame | None = None,
 
 
 # =============================================================================
-# Part 9 -- napari: every flagged mask, on one viewer
+# Part 10 -- napari: every flagged mask, on one viewer
 # =============================================================================
 
 def build_flag_layers(masks: np.ndarray, labels: pd.DataFrame,
@@ -1578,8 +2024,8 @@ def build_flag_layers(masks: np.ndarray, labels: pd.DataFrame,
         layers["dropped: single-slice artifacts"] = dropped
 
     if dapi is not None and counts is not None and edges is not None:
-        bright_thr = b.hist_quantile(counts[1].sum(axis=0), edges, quantile)
-        dim_thr = b.hist_quantile(counts[0].sum(axis=0), edges, quantile)
+        bright_thr = hist_quantile(counts[1].sum(axis=0), edges, quantile)
+        dim_thr = hist_quantile(counts[0].sum(axis=0), edges, quantile)
         present = masks > 0
         layers[f"bright, unmasked (>{bright_thr:,.0f})"] = (
             (~present & (dapi >= bright_thr)).astype(np.uint8))

@@ -1,9 +1,13 @@
-"""Same z-span / area-change analysis as ``segmentation_z_claude.py``, but the
-objects are flagged by an absolute cutoff on the log scale of |Δ area| / area
-instead of by a multiple of the mean change.
+"""z-span / area-change analysis, with objects flagged by an absolute cutoff on
+the log scale of |Δ area| / area instead of by a multiple of the mean change.
 
-Changes from ``segmentation_z_claude.py``
------------------------------------------
+The script it was written as a variant of, ``segmentation_z_claude.py``, has
+since been removed from the repo; this one is the version that was kept.  What
+that baseline did, and what changed here, is below — the choices only read as
+choices against it.
+
+Changes from that baseline
+--------------------------
 1. The flag rule.  The script asked "is this transition more than
    ``AREA_CHANGE_CUTOFF`` x the mean change of its layer?".  This version asks
    "is log10(|Δ area| / area) above ``log10(CHANGE_CUTOFF)``?", i.e. it puts a
@@ -29,9 +33,9 @@ Changes from ``segmentation_z_claude.py``
    worth (``0.5 / area_from``) instead of at a global constant, which keeps the
    floor proportional to the object.  It only ever touches values far below any
    usable cutoff, so no flag depends on it.
-4. The left panel is log-binned on a log x axis (as in
-   ``segmentation_z_claude_log.py``) because the cutoff is only readable there,
-   and the right panel is log-scaled in y with a flat cutoff line -- the
+4. The left panel is log-binned on a log x axis, because the cutoff is only
+   readable there, and the right panel is log-scaled in y with a flat cutoff
+   line -- the
    threshold is the same at every z now, so the interesting question is how much
    of each layer sits above it.  The right panel's second axis shows exactly
    that: the % of transitions flagged per z.

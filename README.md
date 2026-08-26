@@ -1,423 +1,303 @@
-# zspan — comparing segmentations by how far masks span in z
+# Scoring segmentation runs: z-span, area profile, brightness
 
-Cellpose-style 2D segmenters run per z-plane, so one nucleus visible on several
-planes can come back as a single label stretched through z instead of one label
-per plane. **The share of masks spanning more than one z-layer** is a cheap,
-sensitive proxy for how much a run is over-merging in z.
+Cellpose-style segmenters can work a stack two ways — natively in 3D (`do_3D`),
+or per z-plane with the 2D masks stitched afterwards (`stitch_threshold`). This
+repo scores both on the same field and puts the answer on one card, reading the
+TIFFs lazily from a local disk or straight out of S3.
 
-This repo scores a directory of segmentation runs on that metric and compares
-them visually — without ever loading a volume into memory.
+Three measurements, all read off the same volumes:
+
+| | question | what a bad answer looks like |
+|---|---|---|
+| **z-span** | how far does each mask reach through z? | a pile of masks on one or two planes (yield a `min_z` filter discards), or a tail reaching through the whole stack (two nuclei read as one) |
+| **area profile** | does the area-through-z profile wander, or jump? | a profile that turns around plane after plane, or a corner: a flat run, a jump, another flat run |
+| **brightness** | do the voxels a technique claims look like signal? | a masked brightness distribution sliding left toward the unmasked one |
 
 ```python
-from zspan import scan_segmentations, add_variant_column, plot_variant_summary
+import segmentation_helpers_v2 as v2
 
-result = scan_segmentations(
-    "data/segmentations/cpdino",
-    pattern="**/masks.tif",
-    level_names=("preprocessing", "model", "region", "fov"),
-)
-summary = add_variant_column(result.summary, ["preprocessing", "model"])
-plot_variant_summary(summary, group="variant", value="pct_multi_layer")
+scan = v2.scan_regions(TECHNIQUE_ROOTS, DAPI_PATCHES)
+metrics = v2.fov_metrics(scan["labels"], scan["brightness"], scan["filters"])
+v2.plot_scorecard(metrics.droplevel("region"))
 ```
 
-The worked example lives in
-[`z_span_analysis_v4.ipynb`](z_span_analysis_v4.ipynb).
-[`segmentation_method_comparison.ipynb`](segmentation_method_comparison.ipynb)
-comes at the same question from the other end — one field at a time, volumes
-loaded, images alongside — see
-[below](#comparing-the-two-techniques-on-one-field).
+Two worked notebooks, same code, different source of bytes:
+
+| | |
+|---|---|
+| [`segmentation_comparison_v2.ipynb`](segmentation_comparison_v2.ipynb) | reads a local `../data` tree |
+| [`segmentation_comparison_s3.ipynb`](segmentation_comparison_s3.ipynb) | reads an S3 bucket through VirtualiZarr |
+
+They should print identical numbers from the same data — that is the check that
+the loading layer changed nothing.
 
 ## Install
 
 ```bash
-pip install -e ".[xarray,dev]"
-pytest
+pip install -e .            # helpers + the virtual-zarr read path
+pip install -e ".[dev]"     # + ipykernel, to run the notebooks
+pip install -e ".[viewer]"  # + napari, only for the viewers
 ```
 
-The tests build their own miniature TIFF trees in `tmp_path`, so they need no
-data on disk. For the notebooks, point `TECHNIQUE_ROOTS` at your own output —
-`segmentation_method_comparison.ipynb` also wants `DATA_ROOT` and its `METHODS`
-dict, and reads volumes with `tifffile` (the `dev` extra). napari is imported
-only if you ask for a viewer, so a headless kernel runs everything else.
+The editable install is what lets `import segmentation_helpers_v2` work from a
+kernel started anywhere; without it, run from the repo root. **napari is never
+imported at module scope** except in `napari_scripts/segmentation_z_kanai_only.py`,
+so a headless kernel with no Qt runs everything else — every viewer function
+imports it inside the call.
 
-## How it stays in bounds
+Point `TECHNIQUE_ROOTS` and `DAPI_PATCHES` at your own output. Nothing here
+ships data.
 
-Each multi-page TIFF is opened as a lazy zarr array whose chunks are the TIFF's
-own tiles. Nothing is copied or converted; indexing fetches only the tiles the
-window covers.
+## What is in the repo
+
+Two kinds of file, and the line between them is the one structural rule:
+**a module never imports a script; a script calls into a module.**
+
+### Modules — the library
+
+| | |
+|---|---|
+| [`segmentation_loading.py`](segmentation_loading.py) | lazy, chunk-aware TIFF access, local or `s3://`. Imports nothing else here |
+| [`segmentation_helpers_v2.py`](segmentation_helpers_v2.py) | every measurement, the region walk, the scorecard, the paired comparison, the napari layers. Imports only `segmentation_loading` |
+| [`segmentation_brightness_helpers.py`](segmentation_brightness_helpers.py) | two mask volumes over the same image, on the same bins, in the same panel |
+
+`segmentation_helpers_v2.py` is where the measurements live —
+`check_area_jitter`, `check_area_sway` and their flags in Part 2, the histogram
+machinery (`vectorise_pixels`, `build_bin_edges`, `accumulate_histograms` and
+the statistics read off the counts) in Part 3.
+
+### Scripts — one question, one field, a viewer at the end
+
+Each has a CONFIG block at the top, a `main()`, and a napari launch it can be
+told to skip. Set `LAUNCH_NAPARI = False` and they run headless. Each puts the
+repo root on `sys.path` itself, so `python napari_scripts/whichever.py` works
+from a fresh shell whether or not the package is installed.
+
+| | |
+|---|---|
+| [`segmentation_z_kanai_only.py`](napari_scripts/segmentation_z_kanai_only.py) | z-span, the original. `import napari` at module scope, so it needs Qt to import at all |
+| [`segmentation_z_jitter.py`](napari_scripts/segmentation_z_jitter.py) | does the area profile wander up and down |
+| [`segmentation_z_area_sway.py`](napari_scripts/segmentation_z_area_sway.py) | both profile metrics, with the worst drawn over a sample of quiet ones |
+| [`segmentation_z_brightness.py`](napari_scripts/segmentation_z_brightness.py) | brightness inside vs outside the masks, for one run, pooled and per z |
+| [`segmentation_z_log_cutoff.py`](napari_scripts/segmentation_z_log_cutoff.py) | z-span plus per-transition \|Δ area\| / area, flagged by an absolute cutoff on the log axis |
+| [`segmentation_z_brightness_bimodal.py`](napari_scripts/segmentation_z_brightness_bimodal.py) | the notebook's two-technique brightness figure with an absolute cutoff drawn across it |
+
+**The scripts do not carry their own copies of the measurements.** Every one of
+them calls into `segmentation_helpers_v2`, so a script and the notebook's
+scorecard cannot drift apart. The dependency runs one way only: a script may
+import the library, the library never imports a script — a library that imported
+a script would inherit that script's CONFIG globals, and editing a CONFIG block
+would silently move the notebook's numbers.
+
+Where a script and the module ship *different* defaults, the script wraps the
+call rather than re-exporting it. `flag_sway` is the case: the module's
+`SWAY_CUTOFF` is an absolute 3.0, the sway script's is `None`, meaning "flag the
+top decile of this FOV". A bare re-export would have swapped one for the other
+without a word.
+
+## Reading the data
+
+`segmentation_loading` opens each multi-page TIFF as a lazy zarr array whose
+chunks are the file's own tiles. Nothing is copied or converted; indexing
+fetches only the tiles the window covers.
 
 Two backends do that, chosen with `reader=`:
 
 | | `"tifffile"` | `"virtual"` |
 |---|---|---|
 | how | `tifffile`'s `aszarr` store | `virtualizarr` + `virtual_tiff` IFD manifest |
-| open, small tiled file | ~1 ms | 17 ms |
-| open, 7×4000×4000 striped (1750 chunks) | ~1 ms | 325 ms |
-| read, that same 448 MB volume @ 8 MiB blocks | 1.07 s | 1.35 s |
-| peak memory | identical | identical |
+| open, 7×4000×4000 striped | ~1 ms | 325 ms |
+| read, that volume @ 8 MiB blocks | 1.07 s | 1.35 s |
+| peak memory | 29 MB | 29 MB |
 | reads `s3://` via `obstore` | no | **yes** |
 | manifest persists (Icechunk/Kerchunk) | no | **yes** |
 
 `reader="auto"` (the default) routes on the path: a plain local file goes to
-`tifffile`, anything with a non-`file` URL scheme — or any call given an
-`ObjectStoreRegistry` — goes to `virtual`. So the same code moves to object
-storage without an edit, and pays nothing for the manifest until it does.
+`tifffile`, anything with a non-`file` URL scheme — or any call given a registry
+— goes to `virtual`. So the same code moves to object storage without an edit,
+and pays nothing for the manifest until it does. The two agree exactly: same
+`chunks`, same blocks, identical statistics.
 
-The two are interchangeable by construction: same `chunks`, so the same block
-sizes and the same tuning; identical statistics, asserted against the same
-`find_objects` oracle under both. `reader="tifffile"` *raises* rather than
-silently ignores a registry, a remote path, or an `ifd_layout` — a switch that
-quietly reads the wrong thing is worse than no switch.
-
-The metric is then computed by streaming. The observation that makes it work:
-
-> a label's z bounding box is just `min`/`max` over the planes it appears on,
-> and min/max are associative.
-
-So the extent accumulates plane by plane, tile by tile, in any order — peak
-memory is one tile plus two label-indexed arrays, i.e. `O(max_label)` and
-**independent of image size**. On the demo data that is 0.5 MB streamed against
-7.5 MB loaded; the gap widens linearly as volumes grow.
-
-This is not an approximation. `tests/test_zspan.py` keeps the original
-`scipy.ndimage.find_objects` implementation as an oracle and asserts the
-streaming version reproduces it exactly — across random volumes, z-gaps, empty
-planes, sparse and non-contiguous labels, and every block shape.
-
-## Layout
-
-The scanner maps directory levels to columns, so any nesting works:
-
-```
-data/segmentations/cpdino/<preprocessing>/<model>/<region>/<fov>/masks.tif
-                          └── level_names=("preprocessing","model","region","fov")
-```
-
-`level_names` aligns to the **trailing** directories — naming just
-`("region", "fov")` leaves the levels above as `level_0`, `level_1`.
-
-To compare *segmentation techniques*, scan one root per technique and tag each
-scan, so the technique becomes a column rather than a directory level — which is
-what `z_span_analysis_v4.ipynb` does:
-
-```
-data/segmentations_3d_stitched/<model>/<region>/<fov>/masks.tif
-data/segmentations_3d_true/<model>/<region>/<fov>/masks.tif
-                           └── level_names=("model","region","fov")
-```
-
-`relpath` is relative to its own root, so both trees reuse the same values —
-join across them on `technique` + `relpath`, never `relpath` alone.
-
-## What you get back
-
-`scan_segmentations` returns a `ScanResult`:
-
-| | |
-|---|---|
-| `.summary` | one row per volume — level columns plus `n_labels`, `pct_multi_layer`, `mean_z_span`, `max_z_span`, `n_with_z_gaps` |
-| `.labels` | one row per label — `z_start`, `z_end`, `z_span`, `n_planes`, `n_voxels`, `spans_multiple_layers` |
-| `.failures` | `(path, exception)` for volumes that could not be read; one bad file never stops a scan |
-
-`z_span` is the inclusive bounding-box depth; `n_planes` is how many planes the
-label actually occupies. They differ only when a label has a hole in z, so
-**`n_planes < z_span` flags a probable merge of two objects stacked in z** — a
-harder error than plain over-merging, and one `find_objects` alone won't show
-you.
-
-### Per-plane areas
-
-`check_z_span` collapses a label to its extent. `label_plane_areas` stops one
-step earlier and keeps the label's **area on each plane**, which is what a
-change in size between layers is computed from:
+One registry backs a whole scan; build it once and pass it as `registry=`:
 
 ```python
-from zspan import label_plane_areas, size_change_between_layers
+import segmentation_loading as sl
 
-areas = label_plane_areas(volume, n_sections=4)   # label, z, section, area
-steps = size_change_between_layers(areas)         # ... delta, pct_change per z step
+registry, DATA_ROOT = sl.make_registry("s3://bucket/prefix", region="us-west-2")
+scan = v2.scan_regions(TECHNIQUE_ROOTS, DAPI_PATCHES, registry=registry)
 ```
 
-Same accumulation, same guarantee: one chunk-aligned block at a time, per-plane
-results merged across blocks so a label straddling a tile boundary is counted
-once, memory independent of image size. The areas are exact counts, and the
-tests hold them against an in-memory oracle under every block shape.
+`sl.local_registry(path)` does the same for a local tree, which is how the S3
+notebook is exercised without a bucket. Join URL pieces with `sl.join_url` and
+never with `Path`: `Path("s3://b") / "x"` collapses the double slash into
+`s3:/b/x` and the URL stops pointing at the bucket.
 
-`n_sections` splits each plane into that many equal horizontal bands
-(`section_bounds` gives the row ranges) and reports an area per band, so one
-scan answers both *what does the whole field do* and *does the top of it behave
-like the bottom*. A mask crossing a divider is counted in every band it covers,
-so summing `area` over `section` reproduces the whole-plane area **exactly** —
-the whole-field reading is not an approximation of the banded one.
+**Read size is the main lever**, and it matters most over a network, where every
+chunk is its own HTTP request and a striped plane can cost hundreds of round
+trips. `sl.DEFAULT_READ_BYTES` batches whole strips up to a budget; 4–32 MiB all
+measure the same and 8 MiB is the low-variance middle. It never changes a value,
+only the wait.
 
-`size_change_between_layers` differences those along z within each mask. It
-counts only consecutive observations of the same mask: a first plane has nothing
-to change from, and steps that jump a hole in z are dropped by default
-(`adjacent_only=False` keeps them, flagged by `z_gap > 1`) because a mask that
-vanishes and returns is two objects, not one that resized. `group_cols` defaults
-to every column except `z` and `area`, so a concatenated scan carrying
-`technique`/`relpath`/`section` columns differences within each of them without
-being told to.
+## Data layout
 
-## The plots
-
-| Function | Question | Encoding |
-|---|---|---|
-| `plot_variant_summary` | *which variant* wins? | one bar per variant in a single hue, each volume overlaid as a dot |
-| `plot_span_distribution` | *where* does the difference live? | share of labels at each z-span, categorical hues in fixed slot order |
-
-`CATEGORICAL`, `SEQUENTIAL_BLUE` and `BLUES` are exported too, so notebook-side
-figures stay consistent with these. `z_span_analysis_v4.ipynb` builds all three
-of its views inline on top of them — see below — and
-`segmentation_method_comparison.ipynb` copies the same values so its figures
-match without importing the package.
-
-Colours come from a validated palette — adjacent categorical pairs clear
-colour-vision-deficiency separation thresholds. Three of the categorical hues
-sit below 3:1 on a light surface, which is why both notebooks ship a summary
-table next to the charts rather than as an extra.
-
-### Choosing a model, across techniques
-
-`z_span_analysis_v4.ipynb` targets a different question from the package defaults:
-**which model produces fewest throwaway masks, and does that answer survive the
-segmentation technique?** It scans one tree per technique — 2D-per-plane
-`stitch_threshold` output against native `do_3D` output — and scores every run
-on the *thin rate*: the share of masks occupying ≤ 2 z-slices, i.e. exactly what
-a cellpose `min_z = 3` filter discards. Lower is better.
-
-Technique owns the hue channel throughout, so a colour never changes meaning
-between figures; model identity travels on row position and marker shape. Three
-views:
-
-1. **Which model wins, under which technique** — ranked rows, one bar per
-   technique inside each model, one dot per FOV, because with a handful of FOVs
-   per model a gap smaller than the within-model spread is not a result. Pairing
-   the bars is what makes a *flip* — a model that wins under one technique and
-   loses under the other — visible at all.
-2. **Is the win real** — yield against thin rate, one point per FOV, with an
-   arrow from each model's centroid under one technique to its centroid under
-   the other. A model *or* a technique can post a low thin rate purely by not
-   detecting faint cells; this separates *cleaner* from *more conservative*.
-3. **Where the difference lives** — 100% stacked composition of mask thickness,
-   one panel per technique on shared axes, rows in the ranking from view 1. Read
-   down for the model comparison, across for the technique effect with the model
-   held fixed. Single hue light→dark because thickness is *ordinal*.
-
-The notebook prints a coverage table (FOVs scored per model per technique)
-before any figure, so a comparison that is ragged rather than paired cannot pass
-unnoticed.
-
-Note the polarity: the package's `pct_multi_layer` treats spanning many slices
-as the defect (over-merging), while the thin rate treats the opposite end as the
-defect. Both come off the same `n_planes` column; pick whichever matches the
-failure you are chasing.
-
-## Comparing the two techniques on one field
-
-[`segmentation_method_comparison.ipynb`](segmentation_method_comparison.ipynb)
-puts the same two techniques — 2D-per-plane `stitch_threshold` against native
-`do_3D` — on the same field, then scores every FOV in a region.
-
-It runs on a different footing from the rest of the repo. The scanner above
-streams and never holds a volume; this notebook loads them, through
-[`segmentation_z_helpers.py`](segmentation_z_helpers.py). That is a choice, not
-an oversight: the notebook hands the same arrays straight to napari to look at
-the masks it just flagged, and per-plane areas for a single FOV are cheap once
-the volume is already resident. It takes nothing from the package but the
-palette in `zspan/plotting.py`, so figures from both tracks still sit together.
-
-`segmentation_z_helpers.py` is `segmentation_z_claude.py` moved into a module —
-same function bodies, same defaults, same printed wording. What changed is
-listed in its docstring: the config globals became keyword arguments (the
-notebook calls each function once per technique, and a global would silently
-apply one technique's settings to the other), `plot_area_change` renders inline
-by default, `import napari` moved inside `launch_viewer`, and `main()` became
-`analyse_masks()` so the comparison loop can re-run the analysis without
-re-narrating it.
-
-### Two defects, two measurements
-
-| | catches | how |
-|---|---|---|
-| **z-span** | masks stitching never joined up (yield a `min_z` filter discards) and masks reaching the whole stack (two nuclei read as one) | `check_z_span` — the inclusive z bounding box of every label |
-| **area change** | the segmenter changing its mind between adjacent planes | `check_area_change` — `abs_frac_change` = \|Δ area\| / area, one row per (object, z-transition) |
-
-Consecutive planes are a few hundred nanometres apart, so a nucleus's
-cross-section should grow to a mid-plane and shrink away from it smoothly. A
-mask whose area jumps between adjacent layers is usually the segmenter being
-inconsistent, not a cell behaving oddly — and per-plane stitching has a
-per-plane decision to be inconsistent about, where a native `do_3D` run does
-not.
-
-Only transitions where a label is present in **both** planes are counted, so a
-mask appearing or disappearing never registers as a 100% change.
-`flag_area_outliers` compares each transition against a reference —
-`CHANGE_REFERENCE="layer"` uses the mean of that z-transition, which controls
-for systematic drift through the stack, and `"global"` the mean over all of them
-— then flags an object whose `OBJECT_STATISTIC` (`max` or `mean`) of that ratio
-clears `AREA_CHANGE_CUTOFF`.
-
-### What it draws
-
-1. **`plot_area_change`**, per technique — the script's two-panel figure, with
-   the left panel log-binned on a log x axis. `log_hist_range` runs the span
-   from the decade holding the smallest *positive* change, floored
-   `HIST_DECADES` below the largest, up to the largest observed: on a log axis
-   the right tail costs almost no width, so there is no reason to truncate it.
-   Log bins cannot hold zero, so both tails fold into the edge bins and are
-   *counted in the annotation* rather than dropped — the exactly-stable
-   transitions are usually a substantial share of real data. The log axis is a
-   display transform and nothing more; the mean and the `cutoff × mean`
-   threshold are still plain arithmetic means, so the flagged objects and the
-   napari layer are exactly the linear version's. Drawing both techniques, pin
-   `hist_xmin`/`hist_xmax` to the pooled range — a log axis that moves under you
-   is not a comparison.
-2. **`compare_span_distribution`** — share of masks at each z-span, grouped
-   bars, normalised within technique so runs with different mask counts compare
-   directly. The bar at 1 is the yield a `min_z` filter throws away; the `6+`
-   bar is masks reaching most of the way through the stack.
-3. **`compare_layer_change`** — mean |Δ area|/area per z-transition with its
-   IQR band, both techniques on one axes, flag threshold dropped because two
-   means and two thresholds is four lines to read where two carry the
-   comparison. A technique sitting higher *everywhere* is less stable overall; a
-   technique that tracks the other but spikes at one transition is usually one
-   bad plane in the acquisition — and if it is, it spikes in both.
-
-Technique owns the hue channel, and marker shape follows it too, so identity
-never rests on colour alone.
-
-### Scoring a whole region
-
-Sections 1–6 walk a single field. Section 7 scans a region:
-
-```python
-found = h.find_region_fovs(TECHNIQUE_ROOTS, "region_UCI-2424")
-region_labels, region_changes = h.scan_region(found, ...)
-metrics = h.fov_metrics(region_labels, region_changes)
-h.plot_fov_table(metrics, title=...)
+```
+<root>/segmentations_3d_true/<family>/<preprocessing>/<model>/<region>/<fov>/masks.tif
+<root>/segmentations_3d_stitched/<family>/<preprocessing>/<model>/<region>/<fov>/masks.tif
+<root>/patches/<model>/<region>/<fov>/DAPI_decon_z*.tif
 ```
 
-`find_region_fovs` drops any FOV only one technique produced and prints which —
-a ragged comparison is worse than a missing one — and pins technique order to
-`TECHNIQUE_ROOTS` rather than the alphabet, so rows pair up the same way in
-every region. `scan_region` reads only the mask volume, one at a time: the DAPI
-stack is what `load_data` checks against and neither metric needs it, so peak
+Masks are one multi-page TIFF per FOV, one IFD per z-plane; DAPI is one
+single-page TIFF *per* plane, so a directory of them is stacked.
+`TECHNIQUE_ROOTS` maps a technique name to the directory *above* the region, and
+`DAPI_PATCHES` is the matching patches directory — the region name is appended
+wherever it is needed, so it is named once.
+
+`find_region_fovs` drops any FOV only one technique produced and prints which — a
+ragged comparison is worse than a missing one — and pins technique order to
+`TECHNIQUE_ROOTS` rather than the alphabet, so rows pair up the same way in every
+region. One DAPI stack is read per FOV and both mask volumes are histogrammed
+onto bins built from it: two distributions binned differently cannot be laid over
+each other. Only one stack and one mask volume are resident at a time, so peak
 memory is set by the largest FOV rather than by how many there are.
 
-`plot_fov_table` sets the raw per-FOV numbers beside two group scores:
+## The measurements
 
-| | |
-|---|---|
-| `Thinness` | `1 − (pct_thin + pct_single_slice) / 100` |
-| `Stability` | `1 − pct_flagged / 100` |
+### Single-slice masks are removed before anything is measured
 
-Both start at 1.00 and pay a point per percent of defect. A single-plane mask
-lands in both columns of the thinness score, so it costs twice what a two-plane
-one does — one plane is a failed mask outright, two is only what a `min_z = 3`
-filter happens to discard. The scores are **absolute, not ranked**: 0.82 means
-the same thing in every region, and adding a FOV to the table moves nobody.
-Enough defect drives a score below zero, and only the drawn bar clips at 0 — the
-printed number does not, because a 0.00 and a −0.40 are not the same run.
+A mask living on exactly one z plane is an imaging artifact, not a nucleus. It is
+dropped from the volume **first**, so it stops counting as a mask *and* its
+voxels go back into the unmasked brightness pool — the filter has to happen
+upstream of every metric or the brightness figures would still be scoring it.
 
-### The same region, scored on brightness instead
+Per-plane stitching is what produces them, so `DROP_SINGLE_SLICE_IN` can filter
+only that arm; the default filters **both**. Removing masks from one arm and not
+the other moves every rate in that arm's favour, because the masks that survive
+are the thicker ones — its thin rate, its median z-span and its jitter rate all
+improve for free, and none of that improvement is a segmenter doing better. The
+counts removed are printed either way and carried as `n_dropped` / `pct_dropped`:
+reported, never scored, because an artifact of the imaging is not a defect of the
+segmenter.
 
-[`brightness_method_comparison.ipynb`](brightness_method_comparison.ipynb) walks
-the same paired FOVs — same `find_region_fovs`, same technique hues — and asks
-what the mask geometry cannot: **do the voxels a technique claims actually look
-like signal?** Every voxel contributes one `(brightness, is_masked)` pair, so a
-technique that over-grows its masks drags background in and its masked
-distribution slides left toward the unmasked one.
+### z-span
 
-One figure per FOV, two panels — voxels in a mask, voxels not in one — with the
-*techniques* overlaid inside each panel, which is the opposite split from the
-single-run figure in
-[`segmentation_z_brightness_claude.py`](segmentation_z_brightness_claude.py).
-Both techniques segment the same DAPI stack, so the bins are built from it once
-and both mask volumes are histogrammed onto them; two distributions binned
-differently cannot be laid over each other. `auc` — P(a random masked voxel is
+`z_span` is the inclusive depth of a label's z bounding box; `n_planes` is how
+many planes it actually occupies. They differ only when the label has a hole in
+z, so **`n_planes < z_span` flags a probable merge of two objects stacked in z** —
+a harder error than plain over-merging. Both are read off the per-plane areas
+rather than from a second `find_objects` pass, since the areas are what every
+other measurement needs anyway.
+
+### Jitter and sway — two defects, two statistics
+
+Both are dimensionless factors starting at 1.0, so an absolute cutoff means the
+same thing in every FOV.
+
+```
+jitter = 10 ** Σ min(|d[k]|, |d[k+1]|)  over reversals of  d[k] = log10 a[k+1] − log10 a[k]
+sway   = 10 ** max |log10 a[z+1] − 2 log10 a[z] + log10 a[z−1]|
+```
+
+`jitter` asks **how often, and how far, does the profile turn around** — a
+monotone profile scores exactly 1.0 at any steepness, because each reversal is
+weighted by the *smaller* of its two limbs, and summing rather than maxing lets
+many small wobbles outscore one big excursion. `sway` asks **how sharp is the
+worst corner**: the flat-run/jump/flat-run of an over-merge is monotone, so it
+reverses nowhere and scores a clean 1.00 jitter, which is why both are measured.
+
+A plane holding under `AREA_FLOOR` px, or under `SLIVER_FRAC` of the mask's own
+peak area, is a partial-volume sliver and is left out of the profile — every
+nucleus enters and leaves the stack through one, and a sliver against a mid-plane
+is a ratio of hundreds to one that says where the nucleus met the edge of the
+volume, not how it was segmented. Both metrics need three consecutive surviving
+planes and are `NaN` without them, so a mask too short to measure is never
+flagged and never counted in the denominator.
+
+**`JITTER_CUTOFF = 1.75` and `SWAY_CUTOFF = 3.0` are provisional** — worked
+profiles, not real data. `compare_profile_distribution` draws the pooled
+distribution; set them from the knee where the ordinary bulk ends.
+
+### Brightness
+
+Every voxel contributes one `(brightness, is_masked)` pair, histogrammed per z
+plane so peak memory is one slice. `separability` — P(a random masked voxel is
 brighter than a random unmasked one) — is the one number that survives the two
-groups being wildly different sizes, so it compares techniques and FOVs
-directly. Read it next to `frac_masked`: a technique can post a high AUC by
-masking only the brightest voxels and skipping most of the nuclei.
+groups being wildly different sizes. 0.5 says brightness carries no information
+about what the technique masked. Read it next to `frac_masked`: a technique can
+post a high separability by masking only the brightest voxels and skipping most
+of the nuclei.
 
-### Looking at the flagged masks
+### Nothing assumes a normal distribution
 
-`build_span_layers` and `build_change_layer` are label-volume filters: each
-returns a copy of the mask volume with everything but the selected labels
-zeroed, so napari toggles them as separate label layers over the DAPI. One
-viewer per technique over the same DAPI, so the same nucleus can be found under
-each. The viewer blocks the kernel until its window closes, which is why that
-cell is off by default.
+A jitter is a spike at 1.0x with a sparse tail past 100, z-span is a small
+integer count, and voxel brightness is bimodal by construction. So centre and
+spread are the median and the IQR; the cutoffs are absolute rather than quantiles
+of the FOV they are applied to (a quantile cutoff flags the top 10% of every FOV
+*by construction*, which cannot compare two techniques); and comparing two
+techniques is paired **Wilcoxon signed-rank** with the Hodges–Lehmann shift, the
+matched-pairs rank-biserial correlation and a percentile bootstrap CI. The means
+the scripts print are still computed and still shown, and nothing is scored on
+them.
 
-## Scaling further
+## The scorecard
 
-- **Read size is the main lever.** Every `page[...]` call crosses zarr's
-  sync-to-async bridge, costing roughly a millisecond of thread handoff no
-  matter how little data comes back. Reading one native chunk at a time makes
-  that overhead the whole runtime: a 4000×4000 striped TIFF has 250 sixteen-row
-  strips per plane, so a 7-plane volume spends 1,750 round-trips waiting rather
-  than reading. The default batches whole chunks up to `target_bytes` (8 MiB),
-  which cut that same volume from 1,750 reads to 56 and 2.9 s to 1.3 s. It never
-  changes the result, only the speed.
+`score_fovs` turns the per-FOV statistics into four absolute subscores and the
+weighted total they earn:
 
-  Measured on 7×4000×4000 uint32 volumes, the curve is a **plateau with cliffs
-  on both sides**, not a peak:
+| score | | pays for |
+|---|---|---|
+| `Span` | `1 − pct_thin / 100` | masks too short to keep |
+| `Jitter` | `1 − pct_jittery / 100` | masks whose area profile wanders up and down |
+| `Sway` | `1 − pct_swayed / 100` | masks whose profile jumps once and holds |
+| `Signal` | `separability` | masked voxels that do not outshine unmasked ones |
+| `Total` | the four, weighted | out of 1.00 |
 
-  | read size | reads/volume | s/volume | |
-  |---|---|---|---|
-  | 0.2 MiB (native strip) | 1,750 | 2.93 | sync overhead dominates |
-  | 1 MiB | 441 | 1.77 | |
-  | 2–32 MiB | 224 → 14 | **1.30–1.45** | flat, all within noise |
-  | 64 MiB (whole plane) | 7 | 1.68 | allocation + cache pressure |
+The weights live in one constant, `SCORE_WEIGHTS`, and sum to 1, so a clean run
+earns 1.00 and every point lost is traceable to the line that lost it. They are
+unequal on purpose: a corner in an area profile is a segmenter gluing two objects
+together, a wrong answer nothing downstream repairs, while a thin mask is deleted
+by a `min_z` filter in one line. An equal split would have been a weighting too —
+this one just says what it is. Change them in that constant, keep them summing to
+1.00, and say so when you do.
 
-  Inside the plateau the differences are smaller than run-to-run variance, so
-  there is no single magic number to find — anything from 2 to 32 MiB is fine,
-  and only the extremes cost you.
+Every subscore is **absolute**: 0.82 means the same thing in every region, and
+adding a FOV to the table moves nobody. Enough defect drives a rate score below
+zero, and only the drawn bar clips at 0 — a 0.00 and a −0.40 are not the same
+run. `Signal` is the odd one: an AUC's no-information point is 0.5, not 0, so it
+banks half its weight for any technique whose masks are not actively
+anti-correlated with brightness, and the range worth reading on it is about 0.8
+to 1.0. Read a `Total` against other `Total`s rather than as a percentage earned.
 
-- **Tune it on your own hardware** if you want to confirm. The optimum moves
-  with strip height, dtype, CPU cache, and whether bytes come off NVMe or an
-  object store:
-  ```python
-  from zspan import tune_read_size, best_read_size
+A missing line renormalises over the weights that remain — a scan without DAPI
+has no `Signal`, so its `Total` is the other three over the weight they carry
+between them. It is still a number out of 1.00, but it is a shorter rubric, so do
+not read it against a card that has all four.
 
-  table = tune_read_size("region_X/fov_01/masks.tif")   # timings per candidate
-  scan_segmentations(root, target_bytes=best_read_size(table))
-  ```
-  `best_read_size` returns the *middle* of the fast plateau rather than the
-  argmin — the argmin wanders between 4, 8 and 16 MiB across identical runs,
-  while the plateau midpoint is stable and has margin from both cliffs. Tune
-  with the `reader` you will scan with: the block sizes come out the same, but
-  the per-read overhead the curve measures does not.
-- **Don't raise `target_bytes` past the plateau.** Time is flat from 2 to 32 MiB
-  but peak memory tracks the read size linearly — 21 MB at 2 MiB, 29 at 8, 90 at
-  32, 165 at 64 — so anything above ~8 MiB spends the one thing streaming buys
-  and gets nothing back.
-- **Remote data** needs a different store, not different code. This is what
-  `reader="virtual"` exists for, and `"auto"` selects it as soon as the path is
-  a URL or a registry is supplied:
-  ```python
-  from obstore.store import S3Store
-  from obspec_utils.registry import ObjectStoreRegistry
+## Colour
 
-  registry = ObjectStoreRegistry({"s3://bucket/segs": S3Store("bucket")})
-  volume = open_mask_volume("s3://bucket/segs/.../masks.tif", registry)
-  ```
-- **Persist the manifests** with `virtualizarr`'s Icechunk/Kerchunk writers if
-  you rescan often, and later passes skip TIFF header parsing entirely.
-- **Don't count on threads.** `max_workers` avoids pickling volumes between
-  workers, but it does not scale linearly: zarr funnels every chunk request
-  through a single background event loop, so workers contend on it. Measured
-  ~1.1× going from 1 to 4 threads on striped TIFFs, against 2.1× from
-  `target_bytes` alone. Tune the read size first.
+`CATEGORICAL`, `SEQUENTIAL_BLUE` and the theme live in
+`segmentation_helpers_v2.py` and are what every figure in the repo uses.
+Technique owns the hue channel throughout, so a colour never changes meaning
+between figures, and identity also travels on line style and marker shape rather
+than resting on hue alone. Slots are assigned in fixed order and never generated:
+adjacent categorical pairs clear colour-vision-deficiency separation thresholds,
+which only holds if the order is kept.
 
-## napari
+## Looking at the flagged masks
 
-`to_xarray()` returns a lazy dask-backed `DataArray`, so napari pulls only the
-planes it displays:
+`build_flag_layers` returns one label volume per defect — a copy of the mask
+volume with everything but the selected labels zeroed — so napari toggles them
+over the DAPI without recomputing anything. The single-slice masks the filter
+removed come back as their own layer, worth a look at least once to confirm they
+really are artifacts in your data. The two brightness layers are boolean volumes
+instead: "outside every mask yet brighter than the median masked voxel" is not a
+label.
 
 ```python
-import napari
-viewer = napari.Viewer()
-viewer.add_labels(open_mask_volume(path).to_xarray().data)
+layers = v2.build_flag_layers(run["masks"], run["labels"], run["dropped"],
+                              dapi=dapi, counts=run["counts"], edges=run["edges"])
+v2.launch_viewer(dapi, run["masks"], layers, title="region · fov — 3D true")
 ```
+
+One viewer per technique over the same DAPI, so the same nucleus can be found
+under each. The viewer blocks the kernel until its window closes, which is why
+the notebooks keep it in a cell of its own and off by default.

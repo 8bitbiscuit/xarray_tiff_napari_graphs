@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zspan"
-version = "0.1.0"
-description = "Compare segmentation runs by how far their masks span in z, streaming TIFFs as virtual zarr"
+name = "segmentation-comparison"
+version = "0.2.0"
+description = "Score segmentation runs on z-span, area profile and brightness, streaming TIFFs as virtual zarr"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -39,11 +39,12 @@ viewer = ["napari[all]>=0.4.19"]
 # deleted in 3267a2b, which made `pip install -e .` fail outright.  The
 # notebooks import these from the working directory; listing them here just
 # makes the same imports work from anywhere.
+#
+# These three are the whole library.  `napari_scripts/` is deliberately absent:
+# those are scripts, run as files, not modules anything imports -- each puts the
+# repo root on sys.path itself so it can call into the helpers either way.
 py-modules = [
     "segmentation_loading",
     "segmentation_helpers_v2",
     "segmentation_brightness_helpers",
-    "segmentation_metrics",
-    "segmentation_z_area_sway_claude",
-    "segmentation_z_brightness_claude",
 ]

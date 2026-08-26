@@ -26,7 +26,7 @@ FOV.
 
 Reference points: a monotone ramp of any steepness scores **1.00**, a flat run
 with one 10x jump and another flat run **1.00** (it never reverses — that shape
-is what ``sway`` in ``segmentation_z_area_sway_claude.py`` is for), a healthy
+is what ``sway`` in ``segmentation_z_area_sway.py`` is for), a healthy
 grow-peak-shrink arc **1.16**, +-10% noise on a plateau **1.48**, and a profile
 that goes up-down-up-down **53**.
 
@@ -40,16 +40,23 @@ knee where the ordinary bulk ends and the tail begins.
 A mask needs three consecutive surviving planes for a reversal to exist; one
 that never gets them has ``jitter = NaN`` and is never flagged.
 
-The measurement itself lives in ``segmentation_helpers.py`` and is called from
+The measurement itself lives in ``segmentation_helpers_v2.py`` and is called from
 here, so this script and the notebook's scorecard cannot drift apart.
 """
 
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-import segmentation_helpers_v2 as h
+# the helpers sit one directory up.  Running this as
+# `python napari_scripts/segmentation_z_jitter.py` puts only napari_scripts/ on sys.path, so the
+# repo root goes on it too -- `pip install -e .` makes the same imports work
+# without this, and the line is harmless when it has.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import segmentation_helpers_v2 as h  # noqa: E402
 
 # CONFIG
 # ----------------------------------------------------------------------------

@@ -72,6 +72,7 @@ figure run on a machine without Qt.
 
 from __future__ import annotations
 
+import sys
 from itertools import combinations
 from pathlib import Path
 
@@ -79,9 +80,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import segmentation_brightness_helpers as bh
-import segmentation_helpers_v2 as v2
-import segmentation_z_brightness_claude as b
+# the helpers sit one directory up.  Running this as
+# `python napari_scripts/segmentation_z_brightness_bimodal.py` puts only napari_scripts/ on sys.path, so the
+# repo root goes on it too -- `pip install -e .` makes the same imports work
+# without this, and the line is harmless when it has.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import segmentation_brightness_helpers as bh  # noqa: E402
+import segmentation_helpers_v2 as v2  # noqa: E402
 
 # CONFIG
 # ----------------------------------------------------------------------------
@@ -157,7 +163,7 @@ def load_fov(technique_roots=TECHNIQUE_ROOTS, dapi_patches=DAPI_PATCHES,
             f"have: {', '.join(sorted(found['fov'].unique()))}")
 
     dapi, files = v2.load_dapi(v2.fov_dapi_glob(Path(dapi_patches) / region, fov))
-    edges, exact = b.build_bin_edges(dapi)
+    edges, exact = v2.build_bin_edges(dapi)
     if verbose:
         print(f"{region} / {fov}: {len(files)} DAPI planes, shape {dapi.shape}, "
               f"dtype {dapi.dtype}")
@@ -173,8 +179,8 @@ def load_fov(technique_roots=TECHNIQUE_ROOTS, dapi_patches=DAPI_PATCHES,
         kept, _dropped, _areas, report = v2.filter_single_slice(
             volume, drop=v2.drops_here(method, drop_in, drop))
 
-        brightness, present = b.vectorise_pixels(dapi, kept)
-        counts_by_method[method] = b.accumulate_histograms(
+        brightness, present = v2.vectorise_pixels(dapi, kept)
+        counts_by_method[method] = v2.accumulate_histograms(
             brightness, present, edges, exact=exact)
         masks_by_method[method] = kept
         reports[method] = report
@@ -352,8 +358,8 @@ def cross_cutoff_table(counts_by_method, edges,
                 "pct_above_a": pct_above_a,
                 "pct_above_b": pct_above_b,
                 "d_pct_above": pct_above_a - pct_above_b,
-                "auc_below": b.hist_auc(below_a, below_b),
-                "auc_above": b.hist_auc(above_a, above_b),
+                "auc_below": v2.hist_auc(below_a, below_b),
+                "auc_above": v2.hist_auc(above_a, above_b),
             })
 
     table = pd.DataFrame(rows, columns=["group", "method_a", "method_b"] + ACROSS_COLUMNS)

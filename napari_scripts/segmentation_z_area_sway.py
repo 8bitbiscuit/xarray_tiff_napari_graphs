@@ -41,6 +41,7 @@ back 100x.
 
 import glob
 import re
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,6 +49,14 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import tifffile
+
+# the helpers sit one directory up.  Running this as
+# `python napari_scripts/segmentation_z_area_sway.py` puts only napari_scripts/
+# on sys.path, so the repo root goes on it too -- `pip install -e .` makes the
+# same import work without this, and the line is harmless when it has.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import segmentation_helpers_v2 as v2  # noqa: E402
 
 # CONFIG
 # ----------------------------------------------------------------------------
@@ -101,203 +110,37 @@ def load_data(dapi_glob, masks_path):
     return dapi, masks, files
 
 
-def measure_slice_areas(mask_volume):
-    """Pixel count of every label in every z slice -> array of shape (n_z, n_labels + 1)."""
-    n_labels = int(mask_volume.max())
-    areas = np.zeros((mask_volume.shape[0], n_labels + 1), dtype=np.int64)
-
-    for z in range(mask_volume.shape[0]):
-        counts = np.bincount(mask_volume[z].ravel(), minlength=n_labels + 1)
-        areas[z] = counts[:n_labels + 1]
-
-    return areas
-
-
-SWAY_COLUMNS = ["label", "n_planes", "n_planes_used", "area_min", "area_max",
-                "sway", "z_at_sway"]
-
-
-def kept_planes(areas, area_floor=AREA_FLOOR, sliver_frac=SLIVER_FRAC):
-    """Which planes are a real cross-section of each mask, as a boolean array.
-
-    A plane is dropped when it holds fewer than ``area_floor`` px, or less than
-    ``sliver_frac`` of that mask's own peak area.  Both tests are needed and the
-    relative one does the work: every nucleus enters and leaves the stack through
-    a partial-volume sliver, and a sliver against a mid-plane is a ratio of
-    hundreds to one that says where the nucleus met the edge of the volume rather
-    than anything about the segmentation.
-
-    This replaces flooring the areas before the log.  Flooring *clamped* a 16 px
-    onset plane to 20 px and then measured it anyway, which left a ~100x step in
-    every mask's profile by construction -- the artifact that made the old sway
-    metric a ranking of onset steepness.  Excluding the plane is what the floor
-    was always meant to do.
-    """
-    present = areas > 0
-    peak = areas.max(axis=0)
-    return present & (areas >= area_floor) & (areas >= sliver_frac * peak)
-
-
-def check_area_sway(areas, area_floor=AREA_FLOOR, sliver_frac=SLIVER_FRAC):
-    """One row per label: the sharpest corner in its area-through-z profile.
-
-    Only triples of *consecutive present* planes count, so a mask stitched across
-    a z gap does not score a sway for the hole, and appearing or disappearing is
-    not a corner.  ``z_at_sway`` is the middle plane of the worst triple — the
-    plane to scroll to in napari.
-    """
-    present = areas > 0
-    labels = np.flatnonzero(present.any(axis=0))
-    labels = labels[labels > 0]  # drop background
-    if labels.size == 0:
-        return pd.DataFrame(columns=SWAY_COLUMNS)
-
-    keep = kept_planes(areas, area_floor, sliver_frac)
-    log_area = np.log10(np.maximum(areas, 1))
-
-    if areas.shape[0] >= 3:
-        triple = keep[:-2] & keep[1:-1] & keep[2:]
-        # second difference: how much the growth rate changed at the middle plane
-        curvature = np.abs(log_area[2:] - 2.0 * log_area[1:-1] + log_area[:-2])
-        curvature = np.where(triple, curvature, -1.0)
-        measurable = triple.any(axis=0)
-        sway = np.where(measurable, 10.0 ** curvature.max(axis=0), np.nan)
-        z_at_sway = np.where(measurable, curvature.argmax(axis=0) + 1, -1)
-    else:
-        sway = np.full(areas.shape[1], np.nan)
-        z_at_sway = np.full(areas.shape[1], -1)
-
-    absent_high = np.where(present, areas, np.iinfo(np.int64).max)
-
-    return pd.DataFrame({
-        "label": labels.astype(np.int64),
-        "n_planes": present.sum(axis=0)[labels],
-        "n_planes_used": keep.sum(axis=0)[labels],
-        "area_min": absent_high.min(axis=0)[labels],
-        "area_max": areas.max(axis=0)[labels],
-        "sway": sway[labels],
-        "z_at_sway": z_at_sway[labels],
-    })
-
-
-JITTER_COLUMNS = ["label", "n_planes", "n_planes_used", "area_min", "area_max",
-                  "n_reversals", "jitter", "z_at_jitter"]
-
-
-def check_area_jitter(areas, area_floor=AREA_FLOOR, sliver_frac=SLIVER_FRAC):
-    """One row per label: how much its area profile wanders up and down.
-
-    Sway asks *how sharp is the worst corner*, which is a question about a single
-    transition and is answered identically by a corner and by a steep monotone
-    ramp.  This asks a different one -- **how often, and how far, does the profile
-    reverse direction** -- which is the question a jittery mask fails and a ramp,
-    however violent, does not::
-
-        d[k]     = log10 a[k+1] - log10 a[k]        per-step log growth
-        reversal = sign(d[k]) != sign(d[k+1])       direction turned around
-        w[k]     = min(|d[k]|, |d[k+1]|)            how deep the V goes
-        jitter   = 10 ** sum(w over reversals)      a factor, >= 1.0
-
-    Two choices carry the metric.  Weighting a reversal by the **smaller** of its
-    two limbs is what makes a ramp cost nothing: a huge rise followed by a tiny
-    dip is worth the tiny dip, not the huge rise, so the onset ramp that
-    dominated sway cannot dominate this even when a sliver survives the filter.
-    And **summing** rather than taking the max is what lets many small wobbles
-    outscore one big excursion -- under a max, ten alternating 1.5x wobbles score
-    1.5x and a single monotone jump scores 50x, which is exactly backwards.
-
-    A monotone profile scores exactly 1.0 at any steepness.  A healthy nucleus is
-    unimodal -- it grows to its mid-plane and shrinks -- so it contains one
-    reversal at the peak and lands a little above 1.0, typically 1.1-1.3; that
-    peak is **not** exempt, so the cutoff has to sit above the ordinary bulk
-    rather than at 1.0.  ``JITTER_CUTOFF = 1.75`` is a provisional value from
-    worked profiles, not from this data: derive it from the pooled distribution
-    before trusting it, the way the notebook's config note says.
-
-    ``z_at_jitter`` is the middle plane of the deepest reversal -- the plane to
-    scroll to in napari -- and is -1 for a mask that never reverses.
-    """
-    present = areas > 0
-    labels = np.flatnonzero(present.any(axis=0))
-    labels = labels[labels > 0]  # drop background
-    if labels.size == 0:
-        return pd.DataFrame(columns=JITTER_COLUMNS)
-
-    keep = kept_planes(areas, area_floor, sliver_frac)
-    log_area = np.log10(np.maximum(areas, 1))
-
-    if areas.shape[0] >= 3:
-        step_ok = keep[:-1] & keep[1:]              # both ends of this step survive
-        d = np.where(step_ok, log_area[1:] - log_area[:-1], 0.0)
-
-        triple = step_ok[:-1] & step_ok[1:]         # three consecutive kept planes
-        # a flat step has sign 0, so its product is 0 and it is not a reversal:
-        # the profile has to actually turn around, not merely stop rising
-        reversed_here = triple & (np.sign(d[:-1]) * np.sign(d[1:]) < 0)
-        depth = np.where(reversed_here,
-                         np.minimum(np.abs(d[:-1]), np.abs(d[1:])), 0.0)
-
-        measurable = triple.any(axis=0)
-        n_reversals = reversed_here.sum(axis=0)
-        jitter = np.where(measurable, 10.0 ** depth.sum(axis=0), np.nan)
-        z_at_jitter = np.where(n_reversals > 0, depth.argmax(axis=0) + 1, -1)
-    else:
-        n_reversals = np.zeros(areas.shape[1], dtype=np.int64)
-        jitter = np.full(areas.shape[1], np.nan)
-        z_at_jitter = np.full(areas.shape[1], -1)
-
-    absent_high = np.where(present, areas, np.iinfo(np.int64).max)
-
-    return pd.DataFrame({
-        "label": labels.astype(np.int64),
-        "n_planes": present.sum(axis=0)[labels],
-        "n_planes_used": keep.sum(axis=0)[labels],
-        "area_min": absent_high.min(axis=0)[labels],
-        "area_max": areas.max(axis=0)[labels],
-        "n_reversals": n_reversals[labels].astype(np.int64),
-        "jitter": jitter[labels],
-        "z_at_jitter": z_at_jitter[labels],
-    })
-
-
-def flag_metric(df, column, cutoff, quantile=CUTOFF_QUANTILE, flag=None):
-    """Add a boolean flag for ``column`` exceeding ``cutoff``.
-
-    The body of the old :func:`flag_sway`, with the two column names lifted out
-    so jitter and sway can share it.  ``cutoff=None`` takes the quantile of the
-    values that exist -- a rank statistic, so nothing is assumed about the
-    distribution's shape and masks too short to be measured cannot drag it down.
-    """
-    flag = flag or f"large_{column}"
-    df = df.copy()
-    if df.empty:
-        df[flag] = pd.Series(dtype=bool)
-        return df, float("inf"), "no masks"
-
-    if cutoff is None:
-        values = df[column].dropna()
-        cutoff = float(values.quantile(quantile)) if len(values) else float("inf")
-        source = f"p{100 * quantile:g} of this FOV's {column} values"
-    else:
-        cutoff, source = float(cutoff), "set in CONFIG"
-
-    df[flag] = df[column] > cutoff        # NaN compares False
-    return df, cutoff, source
+# The measurement lives in ``segmentation_helpers_v2`` and is called from here,
+# so this script and the notebook's scorecard cannot drift apart -- the same
+# arrangement ``segmentation_z_jitter.py`` uses.  Re-exported under this module's
+# names so the rest of the file, and anything importing it, reads unchanged.
+measure_slice_areas = v2.measure_slice_areas
+kept_planes = v2.kept_planes
+check_area_sway = v2.check_area_sway
+check_area_jitter = v2.check_area_jitter
+flag_metric = v2.flag_metric
+SWAY_COLUMNS = v2.SWAY_COLUMNS
+JITTER_COLUMNS = v2.JITTER_COLUMNS
 
 
 def flag_jitter(jitters, cutoff=JITTER_CUTOFF, quantile=CUTOFF_QUANTILE):
-    """:func:`flag_metric` on ``jitter``.  Returns ``(df, cutoff, source)``."""
-    return flag_metric(jitters, "jitter", cutoff, quantile, flag="large_jitter")
+    """:func:`v2.flag_metric` on ``jitter``.  Returns ``(df, cutoff, source)``.
+
+    Wrapped rather than re-exported so the defaults are this script's CONFIG
+    values and not the module's -- a default binds at import, so re-exporting
+    would quietly ignore the block at the top of this file.
+    """
+    return v2.flag_metric(jitters, "jitter", cutoff, quantile, flag="large_jitter")
 
 
 def flag_sway(sways, cutoff=SWAY_CUTOFF, quantile=CUTOFF_QUANTILE):
     """Add ``large_sway``.  Returns ``(sways, cutoff, source)``.
 
-    ``cutoff=None`` takes the quantile of the sways that exist — a rank
+    ``cutoff=None`` takes the quantile of the sways that exist -- a rank
     statistic, so nothing is assumed about the distribution's shape, and masks
     too short to have a sway can't drag it down.
     """
-    return flag_metric(sways, "sway", cutoff, quantile, flag="large_sway")
+    return v2.flag_metric(sways, "sway", cutoff, quantile, flag="large_sway")
 
 
 def build_sway_layer(masks, df, column="sway"):

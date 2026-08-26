@@ -11,12 +11,15 @@ of unmasked ones. Overlap between the two is where the interesting failures
 live: bright voxels nobody masked (missed signal) and dim voxels inside a mask
 (background pulled in). Both are available as napari layers.
 
-Standalone: nothing is imported from `zspan`, and napari is only imported if
-LAUNCH_NAPARI is on, so the plots work in an environment without Qt.
+The histogram machinery itself lives in `segmentation_helpers_v2.py` and is
+called from here, so this script and the notebook's brightness figures cannot
+drift apart. Nothing is imported from another script, and napari is only
+imported if LAUNCH_NAPARI is on, so the plots work in an environment without Qt.
 """
 
 import glob
 import re
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,6 +28,14 @@ import pandas as pd
 import tifffile
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+
+# the helpers sit one directory up.  Running this as
+# `python napari_scripts/segmentation_z_brightness.py` puts only napari_scripts/
+# on sys.path, so the repo root goes on it too -- `pip install -e .` makes the
+# same import work without this, and the line is harmless when it has.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import segmentation_helpers_v2 as v2  # noqa: E402
 
 # CONFIG
 # ----------------------------------------------------------------------------
@@ -91,191 +102,39 @@ def load_data(dapi_glob, masks_path):
     return dapi, masks, files
 
 
-def vectorise_pixels(dapi, masks):
-    """Collapse (n_z, y, x) to (n_z, n_pixels): one column per pixel, one row per z.
-
-    Column j of both arrays is the same (y, x) location seen through the whole
-    stack, so `brightness[:, j]` and `present[:, j]` are that pixel's brightness
-    and mask-membership vectors.
-    """
-    if dapi.shape != masks.shape:
-        raise ValueError(f"masks shape {masks.shape} != dapi shape {dapi.shape}")
-
-    n_z = dapi.shape[0]
-    brightness = dapi.reshape(n_z, -1)
-    present = (masks > 0).reshape(n_z, -1)
-    return brightness, present
+# The histogram machinery lives in ``segmentation_helpers_v2`` and is called from
+# here, so this script and the notebook's brightness figures cannot drift apart.
+# Re-exported under this module's names, so the rest of the file -- and
+# ``segmentation_z_brightness_bimodal.py``, which builds on the same counts --
+# reads unchanged.
+vectorise_pixels = v2.vectorise_pixels
+accumulate_histograms = v2.accumulate_histograms
+bin_centers = v2.bin_centers
+rebin = v2.rebin
+hist_quantile = v2.hist_quantile
+hist_moments = v2.hist_moments
+hist_auc = v2.hist_auc
+hist_point_biserial = v2.hist_point_biserial
+summarise_by_z = v2.summarise_by_z
+summarise_pooled = v2.summarise_pooled
+STAT_COLUMNS = v2.STAT_COLUMNS
 
 
 def build_bin_edges(brightness, n_bins=FLOAT_HIST_BINS, max_exact_bins=MAX_EXACT_BINS):
-    """Bin edges covering the whole volume, one bin per value where that is cheap."""
-    vmin, vmax = float(brightness.min()), float(brightness.max())
+    """Bin edges covering the whole volume, one bin per value where that is cheap.
 
-    if np.issubdtype(brightness.dtype, np.integer) and (vmax - vmin) < max_exact_bins:
-        lo = int(vmin)
-        n = int(vmax) - lo + 1
-        return np.arange(n + 1, dtype=np.float64) + (lo - 0.5), True
-
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    return np.linspace(vmin, vmax, n_bins + 1), False
-
-
-def accumulate_histograms(brightness, present, edges, exact=False):
-    """Fill per-z histograms on bins you already have.
-
-    Returns counts of shape (2, n_z, n_bins); index 0 is unmasked, 1 is masked.
-    Histogramming per slice instead of keeping the two value arrays around means
-    peak memory stays at one z slice, and every statistic below (quantiles, AUC,
-    correlation) reads off these counts.
-
-    `edges` must span the data — pass what `build_bin_edges` returned for this
-    volume, or for another volume known to cover the same range. Taking the bins
-    as an argument is what lets two mask volumes over the *same* image be
-    histogrammed onto identical bins, which is the only way their distributions
-    can be laid over each other.
+    Wrapped rather than re-exported so the resolution defaults are this script's
+    CONFIG values and not the module's -- a default binds at import, so
+    re-exporting would quietly ignore the block at the top of this file.
     """
-    n_z = brightness.shape[0]
-    n_bins = edges.size - 1
-    counts = np.zeros((2, n_z, n_bins), dtype=np.int64)
-    lo = int(round(edges[0] + 0.5)) if exact else None
-
-    for z in range(n_z):
-        vals = brightness[z]
-        masked_vals = vals[present[z]]
-
-        if exact:
-            index = np.clip(vals.ravel().astype(np.int64) - lo, 0, n_bins - 1)
-            total = np.bincount(index, minlength=n_bins)
-            hit = np.bincount(np.clip(masked_vals.astype(np.int64) - lo, 0, n_bins - 1),
-                              minlength=n_bins)
-        else:
-            total, _ = np.histogram(vals, bins=edges)
-            hit, _ = np.histogram(masked_vals, bins=edges)
-
-        counts[1, z] = hit
-        counts[0, z] = total - hit
-
-    return counts
+    return v2.build_bin_edges(brightness, n_bins=n_bins, max_exact_bins=max_exact_bins)
 
 
 def build_histograms(brightness, present, n_bins=FLOAT_HIST_BINS,
                      max_exact_bins=MAX_EXACT_BINS):
     """Per-z brightness histograms, split by mask presence, on bins of their own."""
-    edges, exact = build_bin_edges(brightness, n_bins=n_bins, max_exact_bins=max_exact_bins)
-    return edges, accumulate_histograms(brightness, present, edges, exact=exact)
-
-
-# --- statistics read straight off the histograms -----------------------------
-
-def bin_centers(edges):
-    return 0.5 * (edges[:-1] + edges[1:])
-
-
-def hist_quantile(counts, edges, q):
-    """Quantile of a binned distribution, interpolated inside the straddled bin."""
-    total = counts.sum()
-    if total == 0:
-        return float("nan")
-
-    cum = np.cumsum(counts)
-    target = q * total
-    i = min(int(np.searchsorted(cum, target, side="left")), counts.size - 1)
-    below = cum[i] - counts[i]
-    frac = 0.0 if counts[i] == 0 else (target - below) / counts[i]
-    frac = min(max(frac, 0.0), 1.0)
-    return float(edges[i] + frac * (edges[i + 1] - edges[i]))
-
-
-def hist_moments(counts, centers):
-    """(mean, population sd) of a binned distribution."""
-    n = counts.sum()
-    if n == 0:
-        return float("nan"), float("nan")
-
-    mean = float((counts * centers).sum() / n)
-    var = float((counts * (centers - mean) ** 2).sum() / n)
-    return mean, float(np.sqrt(max(var, 0.0)))
-
-
-def hist_auc(counts_a, counts_b):
-    """P(a > b) + 0.5 P(a == b) -- the common-language effect size / Mann-Whitney AUC.
-
-    0.5 means the two groups are indistinguishable by brightness alone; 1.0
-    means every masked voxel outshines every unmasked one.
-    """
-    na, nb = counts_a.sum(), counts_b.sum()
-    if na == 0 or nb == 0:
-        return float("nan")
-
-    strictly_below = np.concatenate([[0.0], np.cumsum(counts_b)[:-1]])
-    wins = (counts_a * (strictly_below + 0.5 * counts_b)).sum()
-    return float(wins / (na * nb))
-
-
-def hist_point_biserial(counts_masked, counts_unmasked, centers):
-    """Pearson r between the mask indicator and brightness, over all voxels."""
-    n1, n0 = counts_masked.sum(), counts_unmasked.sum()
-    n = n1 + n0
-    if n1 == 0 or n0 == 0:
-        return float("nan")
-
-    m1, _ = hist_moments(counts_masked, centers)
-    m0, _ = hist_moments(counts_unmasked, centers)
-    _, sd = hist_moments(counts_masked + counts_unmasked, centers)
-    if not sd:
-        return float("nan")
-
-    return float((m1 - m0) / sd * np.sqrt((n1 / n) * (n0 / n)))
-
-
-STAT_COLUMNS = ["z", "n_pixels", "n_masked", "frac_masked",
-                "mean_masked", "mean_unmasked",
-                "median_masked", "median_unmasked",
-                "p25_masked", "p75_masked", "p25_unmasked", "p75_unmasked",
-                "auc", "point_biserial_r"]
-
-
-def _group_stats(masked, unmasked, edges, z=None):
-    centers = bin_centers(edges)
-    n1, n0 = int(masked.sum()), int(unmasked.sum())
-    n = n1 + n0
-
-    mean_masked, _ = hist_moments(masked, centers)
-    mean_unmasked, _ = hist_moments(unmasked, centers)
-
-    return {
-        "z": z,
-        "n_pixels": n,
-        "n_masked": n1,
-        "frac_masked": (n1 / n) if n else float("nan"),
-        "mean_masked": mean_masked,
-        "mean_unmasked": mean_unmasked,
-        "median_masked": hist_quantile(masked, edges, 0.5),
-        "median_unmasked": hist_quantile(unmasked, edges, 0.5),
-        "p25_masked": hist_quantile(masked, edges, 0.25),
-        "p75_masked": hist_quantile(masked, edges, 0.75),
-        "p25_unmasked": hist_quantile(unmasked, edges, 0.25),
-        "p75_unmasked": hist_quantile(unmasked, edges, 0.75),
-        "auc": hist_auc(masked, unmasked),
-        "point_biserial_r": hist_point_biserial(masked, unmasked, centers),
-    }
-
-
-def summarise_by_z(counts, edges):
-    """One row of brightness stats per z slice."""
-    rows = [_group_stats(counts[1, z], counts[0, z], edges, z=z)
-            for z in range(counts.shape[1])]
-    if not rows:
-        return pd.DataFrame(columns=STAT_COLUMNS)
-    return pd.DataFrame(rows, columns=STAT_COLUMNS)
-
-
-def summarise_pooled(counts, edges):
-    """The same stats over the whole stack."""
-    stats = _group_stats(counts[1].sum(axis=0), counts[0].sum(axis=0), edges)
-    stats.pop("z")
-    return pd.Series(stats)
+    return v2.build_histograms(brightness, present, n_bins=n_bins,
+                               max_exact_bins=max_exact_bins)
 
 
 def give_brightness_summary(pooled, per_z):

@@ -8,10 +8,11 @@ against the ones it leaves behind*.
 
 Nothing here re-implements the measurement. The histogram machinery --
 ``vectorise_pixels``, ``build_bin_edges``, ``accumulate_histograms``, and the
-statistics that read off the counts -- is imported from
-``segmentation_z_brightness_claude.py``, and the region walk (``find_region_fovs``)
-and palette come from ``segmentation_helpers_v2.py``. This module is only the
-part neither of those has: **two mask volumes over the same image, on the same
+statistics that read off the counts -- comes from ``segmentation_helpers_v2.py``,
+along with the region walk (``find_region_fovs``) and the palette;
+``segmentation_loading`` is what the object-store reads go through. Neither is a
+script, and nothing here reaches into ``napari_scripts/``. This module is only
+the part v2 does not have: **two mask volumes over the same image, on the same
 bins, in the same panel.**
 
 That last point is why ``accumulate_histograms`` takes its bins as an argument.
@@ -36,7 +37,6 @@ from matplotlib.figure import Figure
 
 import segmentation_helpers_v2 as v2
 import segmentation_loading as sl
-import segmentation_z_brightness_claude as b
 
 # CONFIG DEFAULTS
 # ----------------------------------------------------------------------------
@@ -74,7 +74,7 @@ def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True,
     for fov, rows in found.groupby("fov", sort=True, observed=True):
         dapi, files = load_dapi(
             v2._dapi_arg(dapi_root, fov, pattern, registry), registry, pattern)
-        edges, exact = b.build_bin_edges(dapi)
+        edges, exact = v2.build_bin_edges(dapi)
         counts = {}
 
         for row in rows.itertuples():
@@ -83,8 +83,8 @@ def scan_region_brightness(found, dapi_root, pattern=DAPI_PATTERN, verbose=True,
                 raise ValueError(f"{fov} / {row.method}: masks shape {masks.shape} "
                                  f"!= dapi shape {dapi.shape}")
 
-            brightness, present = b.vectorise_pixels(dapi, masks)
-            counts[str(row.method)] = b.accumulate_histograms(
+            brightness, present = v2.vectorise_pixels(dapi, masks)
+            counts[str(row.method)] = v2.accumulate_histograms(
                 brightness, present, edges, exact=exact)
             del masks, brightness, present
 
@@ -125,7 +125,7 @@ def load_fov(technique_roots, dapi_patches, region, fov, pattern=DAPI_PATTERN,
                  else Path(dapi_patches) / region)
     dapi, _ = load_dapi(v2._dapi_arg(dapi_root, fov, pattern, registry),
                         registry, pattern)
-    edges, exact = b.build_bin_edges(dapi)
+    edges, exact = v2.build_bin_edges(dapi)
 
     masks, counts = {}, {}
     for row in rows.itertuples():
@@ -134,9 +134,9 @@ def load_fov(technique_roots, dapi_patches, region, fov, pattern=DAPI_PATTERN,
             raise ValueError(f"{region} / {fov} / {row.method}: masks shape "
                              f"{volume.shape} != dapi shape {dapi.shape}")
 
-        brightness, present = b.vectorise_pixels(dapi, volume)
+        brightness, present = v2.vectorise_pixels(dapi, volume)
         masks[str(row.method)] = volume
-        counts[str(row.method)] = b.accumulate_histograms(
+        counts[str(row.method)] = v2.accumulate_histograms(
             brightness, present, edges, exact=exact)
 
     return dapi, masks, edges, counts
@@ -165,7 +165,7 @@ def brightness_metrics(runs) -> pd.DataFrame:
     rows = []
     for fov, run in runs.items():
         for method, counts in run["counts"].items():
-            stats = b.summarise_pooled(counts, run["edges"])
+            stats = v2.summarise_pooled(counts, run["edges"])
             rows.append({"fov": fov, "method": method, **stats.to_dict()})
 
     metrics = pd.DataFrame(rows)
@@ -199,7 +199,7 @@ def display_range(runs, clip_quantile=CLIP_QUANTILE):
         if not nonzero.size:
             continue
         los.append(float(run["edges"][nonzero[0]]))
-        his.append(b.hist_quantile(pooled, run["edges"], clip_quantile))
+        his.append(v2.hist_quantile(pooled, run["edges"], clip_quantile))
 
     if not los:
         return None
@@ -234,7 +234,7 @@ def pool_runs(runs, n_bins=4096):
     for run in runs.values():
         for method, counts in run["counts"].items():
             for group in (0, 1):
-                pooled[method][group, 0] += b.rebin(
+                pooled[method][group, 0] += v2.rebin(
                     counts[group].sum(axis=0), run["edges"], edges).astype(np.int64)
 
     return edges, pooled
@@ -279,19 +279,19 @@ def compare_brightness_distributions(
         combined = sum(p["masked"] + p["unmasked"] for p in pooled.values())
         nonzero = np.flatnonzero(combined)
         lo = float(edges[nonzero[0]])
-        top = b.hist_quantile(combined, edges, clip_quantile)
+        top = v2.hist_quantile(combined, edges, clip_quantile)
     if top <= lo:
         top = lo + 1.0
     new_edges = np.linspace(lo, top, n_bins + 1)
-    centers = b.bin_centers(edges)
-    draw_at = b.bin_centers(new_edges)
+    centers = v2.bin_centers(edges)
+    draw_at = v2.bin_centers(new_edges)
 
     frac, totals, over = {}, {}, {}
     for method, groups in pooled.items():
         for group, counts in groups.items():
             total = int(counts.sum())
             totals[method, group] = total
-            frac[method, group] = (b.rebin(counts, edges, new_edges) / total
+            frac[method, group] = (v2.rebin(counts, edges, new_edges) / total
                                    if total else np.zeros(n_bins))
             over[method, group] = int(counts[centers > top].sum())
 
@@ -309,7 +309,7 @@ def compare_brightness_distributions(
                     linestyle=styles[i % len(styles)], linewidth=2, zorder=3,
                     label=f"{method}  (n={totals[method, group]:,})")
 
-            median = b.hist_quantile(pooled[method][group], edges, 0.5)
+            median = v2.hist_quantile(pooled[method][group], edges, 0.5)
             ax.axvline(median, color=colors[method],
                        linestyle=styles[i % len(styles)], linewidth=1.2,
                        alpha=0.55, zorder=2)
@@ -387,8 +387,8 @@ def build_overlap_layers(dapi, masks_by_method, edges, counts_by_method,
     for method, masks in masks_by_method.items():
         counts = counts_by_method[method]
         present = masks > 0
-        bright_thr = b.hist_quantile(counts[1].sum(axis=0), edges, quantile)
-        dim_thr = b.hist_quantile(counts[0].sum(axis=0), edges, quantile)
+        bright_thr = v2.hist_quantile(counts[1].sum(axis=0), edges, quantile)
+        dim_thr = v2.hist_quantile(counts[0].sum(axis=0), edges, quantile)
 
         layers[method] = {
             "bright_unmasked": (~present & (dapi >= bright_thr)).astype(np.uint8),
