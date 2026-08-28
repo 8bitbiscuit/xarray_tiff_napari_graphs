@@ -1150,6 +1150,31 @@ def compare_profile_distribution(labels: pd.DataFrame, column: str = "jitter",
 # Part 5 -- one FOV, all three measurements
 # =============================================================================
 
+def stack_planes(files) -> np.ndarray:
+    """The ``(z, y, x)`` volume ``files`` hold, however they hold it.
+
+    Two layouts, told apart by how many files matched rather than by a flag:
+
+    **many files, a plane each** — the layout this repo's own data is in, one
+    ``DAPI_decon_z*.tif`` per z index.  They are stacked, in the order given.
+
+    **one file, the whole stack** — a multi-page TIFF, which is how the masks
+    have always been stored and how most published annotated datasets ship
+    their images (``.../train/images/dataset_hdf5_050_0.tif`` against
+    ``.../train/masks/dataset_hdf5_050_0.tif``).  Stacking *that* would wrap a
+    volume that is already ``(z, y, x)`` in a length-1 axis and make it
+    ``(1, z, y, x)``, so it is returned as it was read.
+
+    A single-plane file still comes back as ``(1, y, x)``: 2D is promoted the
+    way :func:`load_masks` promotes it, which is also what stacking a
+    one-element list used to do, so nothing about the one-plane case changes.
+    """
+    if len(files) == 1:
+        volume = tifffile.imread(files[0])
+        return volume[np.newaxis] if volume.ndim == 2 else volume
+    return np.stack([tifffile.imread(f) for f in files], axis=0)
+
+
 def load_dapi(dapi_glob, registry=None, pattern=DAPI_PATTERN):
     """The DAPI stack both techniques segmented, read once.
 
@@ -1157,11 +1182,18 @@ def load_dapi(dapi_glob, registry=None, pattern=DAPI_PATTERN):
     filenames gets wrong.  Read once per FOV and reused across techniques: the
     scripts' own loaders re-read the stack for every mask volume.
 
+    A glob that matches a single file is read as the volume it is, rather than
+    stacked into a length-1 axis — see :func:`stack_planes`.  So pointing
+    ``DAPI_GLOB`` at one multi-page TIFF and ``MASKS_PATH`` at its partner is
+    enough to run a script on a dataset stored that way; nothing else in the
+    CONFIG block changes, and the two shapes line up the way every caller
+    asserts they do.
+
     With ``registry`` the argument is the FOV *directory* (a URL) rather than a
     glob string, because object storage has no globbing — the pattern is applied
     to a listing instead — and the planes stream in as chunks through
     :mod:`segmentation_loading`.  Either way the return is the same
-    ``(array, files)`` pair.
+    ``(array, files)`` pair, single-file layout included.
     """
     if registry is not None:
         return sl.load_dapi(dapi_glob, registry, pattern)
@@ -1175,7 +1207,7 @@ def load_dapi(dapi_glob, registry=None, pattern=DAPI_PATTERN):
 
     if not files:
         raise FileNotFoundError(f"No DAPI files matched pattern: {dapi_glob}")
-    return np.stack([tifffile.imread(f) for f in files], axis=0), files
+    return stack_planes(files), files
 
 
 def load_masks(path, registry=None) -> np.ndarray:
@@ -1533,7 +1565,7 @@ POLARITY = {
 # sway is one suspicious transition on an otherwise coherent object.  These
 # numbers are the editorial content of the card -- change them here, in one
 # place, keep them summing to 1.00, and say so when you do.
-SCORE_WEIGHTS = {"Span": 0.10, "Jitter": 0.50, "Sway": 0.10, "Signal": 0.30}
+SCORE_WEIGHTS = {"Span": 0.10, "Jitter": 0.40, "Sway": 0.10, "Signal": 0.40}
 TOTAL_COLUMN = "Total"
 
 SCORE_COLUMNS = ("Span", "Jitter", "Sway", "Signal", TOTAL_COLUMN)

@@ -60,11 +60,11 @@ import segmentation_helpers_v2 as h  # noqa: E402
 
 # CONFIG
 # ----------------------------------------------------------------------------
-MASKS_DIR = Path("../data/segmentations_3d_true/cpdino/decon/VePo/region_UWA-7648/fov_07")
-DAPI_DIR = Path("../data/patches/VePo/region_UWA-7648/fov_07")
+MASKS_DIR = Path("../../data/additional_annotated_datasets/other")
+DAPI_DIR = Path("../../data/additional_annotated_datasets/other")
 
-MASKS_PATH = MASKS_DIR / "masks.tif"
-DAPI_GLOB = str(DAPI_DIR / "DAPI_decon_z*.tif")  # Each z index
+MASKS_PATH = MASKS_DIR / "cell_vizgen_mask.tif"
+DAPI_GLOB = str(DAPI_DIR / "cellpose_segmentation.tif")  # Each z index
 
 RUN_LABEL = None           # legend text; None -> "<region> · <fov>" read off MASKS_DIR
 

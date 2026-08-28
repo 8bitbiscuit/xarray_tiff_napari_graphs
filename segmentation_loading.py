@@ -680,6 +680,12 @@ def open_dapi_volume(
     (chunking, ``to_dask``, ``to_xarray``) is shared.
 
     Returns the volume and the filenames it stacked, in z order.
+
+    One file matching is not one plane: a dataset that ships its images as a
+    single multi-page TIFF stores z the way the *masks* do, an IFD per plane, so
+    that file is opened as a mask volume is and every page comes back.  Taking
+    ``ifd=0`` of it, as the many-file layout does, would silently return the
+    first plane and call it the stack.
     """
     fov_url = as_url(fov_url)
     registry = _registry_for(fov_url, registry)
@@ -689,6 +695,11 @@ def open_dapi_volume(
         raise FileNotFoundError(
             f"no DAPI files matching {pattern!r} under {fov_url}"
         )
+
+    if len(names) == 1:
+        volume = open_mask_volume(join_url(fov_url, names[0]), registry,
+                                  reader="virtual")
+        return volume, names
 
     pages: list[zarr.Array] = []
     for name in names:
